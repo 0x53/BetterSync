@@ -3,5 +3,10 @@
   "private": true,
   "type": "module",
   "exports": { ".": "./src/index.ts" },
-  "dependencies": { "@bettersync/core": "workspace:*" }
+  "bin": { "bettersync": "./src/cli.ts" },
+  "scripts": {
+    "build": "bun build --compile --minify src/cli.ts --outfile dist/bettersync"
+  },
+  "dependencies": { "@bettersync/core": "workspace:*" },
+  "devDependencies": { "@bettersync/server": "workspace:*", "@bettersync/sim": "workspace:*" }
 }

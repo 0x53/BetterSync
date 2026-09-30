@@ -1,5 +1,5 @@
 import { sha256Hex } from "./hash.ts";
-import { conflictCopyPath, isSyncablePath, MAX_NOTE_BYTES, pathKey } from "./paths.ts";
+import { conflictCopyPath, isSyncablePath, MAX_NOTE_BYTES, pathKey, sameNoteName } from "./paths.ts";
 import type { BlobHash, Change, ChangesResponse, Op, OpsResponse, PathState, Seq, StateResponse } from "./protocol.ts";
 
 /**
@@ -80,6 +80,12 @@ interface BaseEntry {
   /** Local stat when the file was last known to hold `hash` (or `prev`), to skip rehashing. */
   mtime?: number;
   size?: number;
+  /**
+   * The mtime was within RACY_MS of when it was recorded, so an edit saved
+   * right after may share it (and the size): the stat cannot vouch for the
+   * content, and the next pass rehashes. Git calls this "racily clean".
+   */
+  racy?: true;
   /** On a deleted entry: the content the delete removed here, to spot the same file under another name. */
   prev?: BlobHash;
 }
@@ -107,6 +113,8 @@ export interface PassReport {
 }
 
 const OPS_BATCH = 100;
+/** Filesystem timestamps are coarse (ext4: a few ms; FAT: 2 s), so a stat this recent may hide an edit. */
+const RACY_MS = 2000;
 
 interface Planned {
   op: Op;
@@ -251,7 +259,7 @@ export class SyncEngine {
         report.applied++;
       }
       const st = await this.deps.fs.stat(s.path);
-      this.setBase(key, { path: s.path, version: s.version, hash: s.hash, ...(st && { mtime: st.mtime, size: st.size }) });
+      this.setBase(key, { path: s.path, version: s.version, hash: s.hash, ...(st && this.statCache(st)) });
       return true;
     }
     if (h !== null && !this.safe(key, h)) return false;
@@ -259,8 +267,13 @@ export class SyncEngine {
     if (local && local.path !== s.path && !(await this.renameLocal(local.path, s.path))) return false;
     const st = await this.deps.fs.write(s.path, bytes);
     report.applied++;
-    this.setBase(key, { path: s.path, version: s.version, hash: s.hash, mtime: st.mtime, size: st.size });
+    this.setBase(key, { path: s.path, version: s.version, hash: s.hash, ...this.statCache(st) });
     return true;
+  }
+
+  /** A stat to remember for a file, flagged racy when its mtime is too recent to vouch for its content. */
+  private statCache(st: LocalStat): Pick<BaseEntry, "mtime" | "size" | "racy"> {
+    return st.mtime > this.deps.now() - RACY_MS ? { mtime: st.mtime, size: st.size, racy: true } : { mtime: st.mtime, size: st.size };
   }
 
   private isNewer(key: string, version: Seq): boolean {
@@ -291,7 +304,7 @@ export class SyncEngine {
       const st = await this.deps.fs.stat(path!);
       if (!st || st.size > MAX_NOTE_BYTES) continue;
       const base = this.state.files[key];
-      if (base?.hash && base.path === st.path && base.mtime === st.mtime && base.size === st.size) {
+      if (base?.hash && !base.racy && sameNoteName(base.path, st.path) && base.mtime === st.mtime && base.size === st.size) {
         locals.set(key, { path: st.path, hash: base.hash });
         continue;
       }
@@ -299,10 +312,10 @@ export class SyncEngine {
       if (!bytes) continue;
       const hash = await this.hash(bytes);
       locals.set(key, { path: st.path, hash, bytes });
-      if (base?.hash === hash && base.path === st.path) {
+      if (base?.hash === hash && sameNoteName(base.path, st.path)) {
         // Touched but unchanged: refresh the stat cache.
-        base.mtime = st.mtime;
-        base.size = st.size;
+        delete base.racy;
+        Object.assign(base, this.statCache(st));
       }
     }
 
@@ -314,7 +327,7 @@ export class SyncEngine {
         created.push(key);
       } else {
         // A case-only rename; an edit made alongside it follows as a put, which the server merges onto the move.
-        const renamed = l.path !== base.path;
+        const renamed = !sameNoteName(l.path, base.path);
         if (renamed) planned.push({ op: { op: "move", from: base.path, to: l.path, baseVersion: base.version }, ...(l.hash === base.hash && { ack: { key, hash: l.hash } }) });
         if (l.hash !== base.hash) planned.push({ op: { op: "put", path: l.path, hash: l.hash, baseVersion: base.version }, bytes: l.bytes!, ack: { key, hash: l.hash } });
       }

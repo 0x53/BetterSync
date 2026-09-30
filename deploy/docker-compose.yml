@@ -1,0 +1,19 @@
+# docker compose -f deploy/docker-compose.yml up -d
+# The first start prints the access token once:
+#   docker compose -f deploy/docker-compose.yml logs bettersync
+# Rotate it with:
+#   docker compose -f deploy/docker-compose.yml exec bettersync bettersync rotate-token
+services:
+  bettersync:
+    build: ..
+    image: bettersync-server
+    restart: unless-stopped
+    # Localhost only: nginx on the host terminates TLS (deploy/nginx.conf).
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      # Back up by copying this volume (or bind-mount a folder owned by uid 10001).
+      - bettersync-data:/data
+
+volumes:
+  bettersync-data:

@@ -1,0 +1,19 @@
+# systemd unit for the headless client. Install the binary
+# (bun run --cwd packages/headless build → packages/headless/dist/bettersync)
+# to /usr/local/bin, put the token in /etc/bettersync/agent.env as
+#   BETTERSYNC_TOKEN=...
+# then: systemctl enable --now bettersync-headless
+[Unit]
+Description=BetterSync headless client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=agent
+EnvironmentFile=/etc/bettersync/agent.env
+ExecStart=/usr/local/bin/bettersync sync /home/agent/vault --server https://notes.example.com --device agent-1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

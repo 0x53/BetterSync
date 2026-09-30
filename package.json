@@ -9,6 +9,8 @@
     "test": "bun test",
     "fuzz": "FUZZ_ITERS=20000 bun test packages/core/test/merge.fuzz.test.ts",
     "sim": "SIM_SEEDS=5000 bun test packages/sim",
+    "kill": "E2E_RUNS=10 E2E_SECONDS=60 bun test packages/headless/test/kill.test.ts",
+    "build": "bun run --cwd packages/server build && bun run --cwd packages/headless build",
     "typecheck": "tsc --noEmit -p ."
   },
   "devDependencies": {

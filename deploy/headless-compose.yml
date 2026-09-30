@@ -1,0 +1,16 @@
+# The headless client in Docker, keeping ./vault in sync; mount the same
+# folder into the agent's container.
+#   BETTERSYNC_TOKEN=... docker compose -f deploy/headless-compose.yml up -d
+services:
+  bettersync-agent:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.headless
+    image: bettersync-headless
+    restart: unless-stopped
+    user: "1000:1000"
+    volumes:
+      - ./vault:/vault
+    environment:
+      BETTERSYNC_TOKEN: ${BETTERSYNC_TOKEN}
+    command: ["sync", "/vault", "--server", "https://notes.example.com", "--device", "agent-1"]

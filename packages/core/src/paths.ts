@@ -38,6 +38,20 @@ export function pathKey(path: string): string {
 }
 
 /**
+ * Whether two names for one note agree as far as a device controls them:
+ * the file name exactly, folder names ignoring case. On a case-insensitive
+ * disk "Projects/a.md" and "projects/b.md" share one folder, so a device
+ * cannot give each note its own folder case; treating that as a rename would
+ * make devices move notes back and forth forever.
+ */
+export function sameNoteName(a: string, b: string): boolean {
+  if (a === b) return true;
+  const i = a.lastIndexOf("/");
+  const j = b.lastIndexOf("/");
+  return a.slice(i + 1) === b.slice(j + 1) && pathKey(a.slice(0, i + 1)) === pathKey(b.slice(0, j + 1));
+}
+
+/**
  * Name for the losing side of a conflict, next to the note:
  * "Folder/Note.md" → "Folder/Note (conflict 2026-09-30 laptop).md", with
  * " 2", " 3", ... appended if that key is taken.

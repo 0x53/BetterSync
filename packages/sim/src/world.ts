@@ -1,4 +1,4 @@
-import { MemoryVaultStore, pathKey, Rng, SyncEngine, Vault, type Op, type PassReport, type Remote } from "@bettersync/core";
+import { MemoryVaultStore, pathKey, Rng, SyncEngine, Vault, type Change, type Op, type PassReport, type Remote, type VaultStore } from "@bettersync/core";
 import { SimFs, type Clobber } from "./fs.ts";
 import { hashAsync, hashSync } from "./hash.ts";
 import { checkInvariants } from "./invariants.ts";
@@ -16,8 +16,17 @@ export interface SimConfig {
   initialNotes?: number;
   /** Crashes, partitions, lost and slow messages. Default on. */
   faults?: boolean;
+  /**
+   * Opens the server's store. Called at start and again after every server
+   * crash, so a persistent store (SQLite) is reopened from disk. Default: one
+   * in-memory store that survives crashes.
+   */
+  store?: () => SimStore;
   log?: (message: string) => void;
 }
+
+/** A VaultStore the invariant checks can read the whole log from. */
+export type SimStore = VaultStore & { allChanges(): readonly Change[]; close?(): void };
 
 export interface SimResult {
   seed: number;
@@ -67,7 +76,8 @@ interface SimClient {
 export class World {
   readonly sched = new Scheduler();
   readonly rng: Rng;
-  readonly store = new MemoryVaultStore();
+  store: SimStore;
+  private readonly openStore: () => SimStore;
   vault: Vault;
   serverUp = true;
   serverEpoch = 0;
@@ -85,6 +95,9 @@ export class World {
   constructor(readonly config: SimConfig) {
     this.rng = new Rng(config.seed);
     this.faults = config.faults ?? true;
+    const memory = new MemoryVaultStore();
+    this.openStore = config.store ?? (() => memory);
+    this.store = this.openStore();
     this.vault = this.newVault();
     const n = config.clients ?? this.rng.int(3, 10);
     const agents = config.agents ?? (n > 3 ? 1 : 0);
@@ -94,6 +107,15 @@ export class World {
       const caseInsensitive = device.startsWith("agent") ? false : this.rng.chance(0.7);
       this.clients.push({ device, fs: new SimFs(caseInsensitive, () => ++this.mtime), stateJson: null, epoch: 0, online: true });
     }
+  }
+
+  /** A server (re)start: reopen the store, then a fresh Vault with an empty queue. */
+  private restartServer() {
+    const old = this.store;
+    this.store = this.openStore();
+    if (old !== this.store) old.close?.();
+    this.vault = this.newVault();
+    this.serverUp = true;
   }
 
   private newVault() {
@@ -116,6 +138,7 @@ export class World {
     if (converged) this.violations.push(...checkInvariants(this));
     this.stats.changes = this.store.seq();
     this.stats.files = this.store.liveRows().length;
+    this.store.close?.();
     return { seed: this.config.seed, clients: this.clients.length, violations: this.violations, stats: this.stats };
   }
 
@@ -254,10 +277,7 @@ export class World {
       this.stats.crashes++;
       this.serverUp = false;
       this.serverEpoch++;
-      this.sched.at(this.rng.int(200, 3000), () => {
-        this.vault = this.newVault();
-        this.serverUp = true;
-      });
+      this.sched.at(this.rng.int(200, 3000), () => this.restartServer());
     }
   }
 
@@ -268,10 +288,7 @@ export class World {
     this.faults = false;
     this.stopping = true;
     for (const c of this.clients) c.online = true;
-    if (!this.serverUp) {
-      this.vault = this.newVault();
-      this.serverUp = true;
-    }
+    if (!this.serverUp) this.restartServer();
     for (const c of this.clients) {
       if (!c.engine) {
         c.epoch++;

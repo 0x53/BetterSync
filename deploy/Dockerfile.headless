@@ -1,0 +1,13 @@
+# The headless client as an image. Build from the repo root:
+#   docker build -f deploy/Dockerfile.headless -t bettersync-headless .
+FROM oven/bun:1.4 AS build
+WORKDIR /src
+COPY package.json bun.lock tsconfig.json ./
+COPY packages ./packages
+RUN bun install --frozen-lockfile
+RUN bun build --compile --minify packages/headless/src/cli.ts --outfile /out/bettersync
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/bettersync /usr/local/bin/bettersync
+ENTRYPOINT ["bettersync"]

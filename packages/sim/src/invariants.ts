@@ -1,20 +1,58 @@
-import { pathKey, type FileRow } from "@bettersync/core";
+import { pathKey, sameNoteName, type Change, type FileRow } from "@bettersync/core";
+import type { Clobber } from "./fs.ts";
 import { hashSync } from "./hash.ts";
 import type { World } from "./world.ts";
 
-/**
- * The design doc's invariants, checked once every client is online and idle.
- * The fifth, crash safety, is that these still hold with crashes injected
- * during the run.
- */
+/** Everything the invariants look at, gathered from the simulator or from real processes (the kill tests). */
+export interface Observed {
+  /** The server's whole change log. */
+  changes: readonly Change[];
+  /** The server's live rows. */
+  rows: readonly Pick<FileRow, "path" | "hash" | "version">[];
+  /** Each client's syncable files: actual name → content hash. */
+  clients: { device: string; files: Map<string, string> }[];
+  /** Content the engine overwrote, deleted or renamed away on a device. */
+  clobbered: readonly Clobber[];
+  /** Content a user put at a path key, by writing it there or moving it in from another key. */
+  placed: readonly { key: string; hash: string; time: number; moved: boolean }[];
+  /**
+   * Compare folder names ignoring case, as on a real case-insensitive disk,
+   * where notes share a folder whose case the device cannot set per note.
+   */
+  looseFolders?: boolean;
+}
+
+/** The design doc's invariants for a simulated world, checked once every client is online and idle. */
 export function checkInvariants(w: World): string[] {
+  return checkObserved({
+    changes: w.store.allChanges(),
+    rows: w.store.liveRows(),
+    clients: w.clients.map((c) => ({ device: c.device, files: new Map([...c.fs.syncable()].map(([p, b]) => [p, hashSync(b)])) })),
+    clobbered: w.clobbered,
+    placed: w.placed,
+  });
+}
+
+/**
+ * The design doc's invariants. The fifth, crash safety, is that these still
+ * hold with crashes injected during the run.
+ */
+export function checkObserved(o: Observed): string[] {
   const out: string[] = [];
-  const changes = w.store.allChanges();
+  const changes = o.changes;
 
   // 1. Convergence: every client's syncable files equal the server's, byte for byte, names included.
-  const server = new Map(w.store.liveRows().map((r) => [r.path, r.hash!]));
-  for (const c of w.clients) {
-    const local = new Map([...c.fs.syncable()].map(([p, b]) => [p, hashSync(b)]));
+  const server = new Map(o.rows.map((r) => [r.path, r.hash!]));
+  for (const c of o.clients) {
+    let local = c.files;
+    if (o.looseFolders) {
+      // Rename each local file to the server's name for it when they differ only in folder case.
+      const byKey = new Map([...server.keys()].map((p) => [pathKey(p), p]));
+      local = new Map([...local].map(([p, h]) => {
+        const s = byKey.get(pathKey(p));
+        return [s !== undefined && sameNoteName(s, p) ? s : p, h];
+      }));
+    }
     const diffs: string[] = [];
     for (const [p, h] of server) if (local.get(p) !== h) diffs.push(`${p}: server ${h.slice(0, 8)}, local ${local.get(p)?.slice(0, 8) ?? "missing"}`);
     for (const p of local.keys()) if (!server.has(p)) diffs.push(`${p}: only local`);
@@ -27,7 +65,7 @@ export function checkInvariants(w: World): string[] {
     if (c.hash) kept.add(c.hash);
     if (c.submitted) kept.add(c.submitted);
   }
-  for (const x of w.clobbered) {
+  for (const x of o.clobbered) {
     if (!kept.has(x.hash)) out.push(`silent loss: ${x.device} replaced ${x.path} (${x.hash.slice(0, 8)}) at t=${x.time}, and the server never had it`);
   }
 
@@ -56,7 +94,7 @@ export function checkInvariants(w: World): string[] {
       const gone = deletedWith.get(key);
       for (const h of [c.hash, c.submitted]) {
         if (!h || !gone?.hashes.has(h)) continue;
-        if (w.placed.some((p) => p.hash === h && (p.key === key ? p.time >= gone.time : p.moved))) continue;
+        if (o.placed.some((p) => p.hash === h && (p.key === key ? p.time >= gone.time : p.moved))) continue;
         out.push(`resurrection: seq ${c.seq} brought back ${c.path} (${h.slice(0, 8)}) after it was deleted`);
       }
     }
@@ -73,7 +111,7 @@ export function checkInvariants(w: World): string[] {
     if (c.hash === null) replay.delete(pathKey(c.path));
     else replay.set(pathKey(c.path), { path: c.path, hash: c.hash, version: c.seq });
   }
-  const rows = w.store.liveRows();
+  const rows = o.rows;
   const same = rows.length === replay.size && rows.every((r) => {
     const x = replay.get(pathKey(r.path));
     return x && x.path === r.path && x.hash === r.hash && x.version === r.version;
