@@ -4,3 +4,5 @@ export * from "./merge.ts";
 export * from "./paths.ts";
 export * from "./prng.ts";
 export * from "./protocol.ts";
+export * from "./engine.ts";
+export * from "./vault.ts";

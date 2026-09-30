@@ -2,10 +2,13 @@
   "name": "bettersync",
   "private": true,
   "type": "module",
-  "workspaces": ["packages/*"],
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "test": "bun test",
     "fuzz": "FUZZ_ITERS=20000 bun test packages/core/test/merge.fuzz.test.ts",
+    "sim": "SIM_SEEDS=5000 bun test packages/sim",
     "typecheck": "tsc --noEmit -p ."
   },
   "devDependencies": {

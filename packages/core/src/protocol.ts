@@ -1,6 +1,5 @@
 /**
  * Wire types for the client ↔ server protocol (design doc, "Server" → "API").
- * Draft: settled in M1 alongside the engine and simulator.
  */
 
 /** Server sequence number; a file's version is the seq of its last change. */
@@ -15,6 +14,17 @@ export interface FileEntry {
   size: number;
   mtime: number;
   version: Seq;
+}
+
+/**
+ * The server's current state of one path key: a live file, or `hash: null`
+ * when the key is deleted (version = the delete's seq) or never existed
+ * (version 0).
+ */
+export interface PathState {
+  path: string;
+  version: Seq;
+  hash: BlobHash | null;
 }
 
 /** GET /v1/state */
@@ -37,6 +47,10 @@ export interface Change {
   baseVersion: Seq | null;
   device: string;
   time: number;
+  /** The content a client sent when the server merged it into `hash`. Kept in history. */
+  submitted?: BlobHash;
+  /** Set on a conflict copy: the note whose edit it preserves. */
+  conflictOf?: string;
 }
 
 /** GET /v1/changes */
@@ -48,7 +62,7 @@ export interface ChangesResponse {
 
 /** baseVersion null means "I believe this path does not exist yet". */
 export type Op =
-  | { op: "put"; path: string; hash: BlobHash; size: number; baseVersion: Seq | null }
+  | { op: "put"; path: string; hash: BlobHash; baseVersion: Seq | null }
   | { op: "delete"; path: string; baseVersion: Seq }
   | { op: "move"; from: string; to: string; baseVersion: Seq };
 
@@ -57,15 +71,25 @@ export interface OpsRequest {
   ops: Op[];
 }
 
-export type OpResult =
-  /** Base was current; applied as sent. */
-  | { status: "accepted"; seq: Seq }
-  /** Base was stale; merged cleanly with the newer version into `hash`. */
-  | { status: "merged"; seq: Seq; hash: BlobHash }
-  /** Base was stale and edits overlapped; the server version stays and the sent content was saved at `conflictPath`. */
-  | { status: "conflicted"; seq: Seq; conflictPath: string }
+export type OpStatus =
+  /** Base was current (or a stale move/restore that still applies); applied as sent. */
+  | "accepted"
+  /** Base was stale; merged cleanly with the newer version. */
+  | "merged"
+  /** Base was stale and edits overlapped; the server version stays and the sent content became a conflict copy. */
+  | "conflicted"
+  /** Nothing to do: the content is already current or already in this path's history, or the source is gone. */
+  | "unchanged"
   /** A stale delete lost to a newer edit (edit wins); nothing changed. */
-  | { status: "superseded"; current: FileEntry }
+  | "superseded";
+
+export type OpResult =
+  | {
+      status: OpStatus;
+      /** Current state of every path key the op touched, so the client can adopt it. */
+      files: PathState[];
+      conflictPath?: string;
+    }
   | { status: "rejected"; reason: string };
 
 export interface OpsResponse {
