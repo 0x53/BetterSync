@@ -1,0 +1,7 @@
+{
+  "name": "@bettersync/server",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": { "@bettersync/core": "workspace:*" }
+}
