@@ -53,7 +53,7 @@ docker compose -f deploy/docker-compose.yml exec bettersync bettersync rotate-to
 
 Without Docker: `bun packages/server/src/cli.ts serve --data ./data` (listens on 127.0.0.1:8787).
 
-Obsidian plugin: `bun run build`, then copy `packages/plugin/dist/main.js` and `manifest.json` into `<vault>/.obsidian/plugins/bettersync/`, enable BetterSync under Community plugins, and enter the server URL and token. On iOS, copy the same two files into the vault's `.obsidian/plugins/bettersync/` folder (through the Files app or any tool that reaches the vault).
+Obsidian plugin: `bun run build`, then copy `packages/plugin/dist/main.js` and `manifest.json` into `<vault>/.obsidian/plugins/bettersync/`, enable BetterSync under Community plugins, and enter the server URL and token. On iOS, where the Files app hides `.obsidian`, install with the BRAT plugin: "Add beta plugin" → `0x53/BetterSyncReleases`. To publish a version there, commit the two built files (with a new `version` in `manifest.json`) to that repo and run its Release workflow from the Actions tab.
 
 Headless client, for agents and scripts:
 
