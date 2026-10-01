@@ -1,0 +1,134 @@
+# Fixes from the M3 daily-driver trial
+
+Found while deploying BetterSync `b0d1119` on a home server (server and headless
+client in Docker behind nginx at a path prefix) and Obsidian on Windows (`laptop`).
+The tests started on 2026-10-01. Ordered by priority.
+
+## 1. Continuous typing on a contested line makes one conflict copy per autosave
+
+**Severity:** high for usability, but nothing is lost. The worst case is clutter, as designed.
+
+**Repro (2026-10-01 21:51, Windows plugin and the headless client):**
+
+1. `BetterSync test.md` is open in Obsidian on Windows. Type `aaaa…` continuously at the
+   end of `Line A`.
+2. From the headless side, overwrite `Line A` three times, about 4 s apart
+   (21:51:40, :44 and :48).
+3. Keep typing for about 20 s after the last remote edit.
+
+**Expected:** at most one conflict copy, plus about one more per remote edit. The README
+describes this case as "2 conflict copies here" and says that, once Obsidian autosaves,
+"the server merges it or keeps it as one conflict copy".
+
+**Observed:** **7 conflict copies**, and 7 notices on Windows. The copies kept coming every
+2–5 s for 18 s after the last remote edit and stopped only when typing stopped. Each copy
+is a growing snapshot of the same typing (24, 30, 42, 60, 74 … `a`s). The main note
+correctly held the remote version, and Windows matched it afterwards.
+
+Server log (`/v1/changes`, local times):
+
+```
+257 21:51:38 put  BetterSync test.md            base 256  laptop
+258 21:51:40 put  BetterSync test.md            base 257  homeserver
+259 21:51:40 put  … (conflict … laptop)         base -    laptop
+260 21:51:42 put  … (conflict … 2)              base -    laptop
+261 21:51:44 put  BetterSync test.md            base 258  homeserver
+262 21:51:48 put  BetterSync test.md            base 261  homeserver   ← last remote edit
+263 21:51:48 put  … (conflict … 3)              base -    laptop
+264 21:51:53 put  … (conflict … 4)              base -    laptop
+265 21:51:59 put  … (conflict … 5)              base -    laptop
+266 21:52:04 put  … (conflict … 6)              base -    laptop
+267 21:52:06 put  … (conflict … 7)              base -    laptop
+```
+
+**Likely mechanism.** `ObsidianFs.writeThroughEditors` marks the note `busy` and throws
+`LocalBusyError`. `main.ts:185` then stops force-saving it, but Obsidian's own 2 s
+autosave still writes the file. The engine pushes that save as a local edit on the stale
+base, and the server keeps it as a conflict copy. The incoming version then still
+overlaps the editor's newer typing, so the note becomes busy again. The next autosave
+repeats the cycle. Replay detection cannot catch it, because each save has new content.
+The result is one copy per autosave for as long as typing continues, even after the
+remote side has gone quiet.
+
+**Fix options** (the first is probably smallest and most general):
+
+- **Server: fold repeated stale pushes into one copy.** When a device puts path P on base
+  B, and its earlier put on P with the same base B already became conflict copy C, apply
+  the new put to C (C's latest version as base, so it fast-forwards) instead of making a
+  new copy. Record the conflict copy against `(device, path, base)` in the store.
+- **Plugin: once a conflict copy exists for an open note, stop pushing that note.** Wait
+  until its editor has been idle for some seconds, then three-way merge the server text
+  into the editor once more before pushing. Typing still wins locally until it settles.
+- **Plugin: one notice per note per conflict episode,** not one per copy (see item 3).
+
+**Test to add:** the fake-vault test "continuous typing on the very line another device
+edits" should also keep typing for N seconds after the remote side stops, and assert that
+the number of copies does not grow during that tail. The real-Obsidian end-to-end test
+should do the same. The trial suggests the fake vault's autosave timing does not match
+Windows Obsidian 1.x.
+
+## 2. DiskFs follows symlinked parent folders (security)
+
+**Severity:** high wherever another program can write into the synced folder. That is the
+agent use case the headless client exists for.
+
+`DiskFs.resolve`'s fast path, `write` (`mkdir -p`, temp file, `rename`), `remove` (`rm`)
+and `rename` all use `join(root, path)`. `lstat` and `rm` only refuse to follow a symlink
+in the **last** component, so a symlinked parent folder is still followed. An agent that
+can write inside the vault can replace `notes/` with a symlink to `/somewhere/else`. A
+later remote change to `notes/x.md` is then written, renamed or deleted outside the vault
+under the client's user. `list()` correctly skips symlinks, but the write paths do not.
+The README's "Symlinks are not followed" holds only for the final component.
+
+**Workaround in use:** the headless client runs in a container that mounts only the vault,
+with a read-only root and all capabilities dropped. A planted link can then reach nothing
+outside the vault.
+
+**Fix:** before acting, `lstat` every component from `root` to the parent and refuse any
+symlink (`ConcurrentChangeError` or a dedicated error), checking again after the temp-file
+write and before `rename`. Better still, keep a directory file descriptor and use
+`openat`/`renameat` with `O_NOFOLLOW` (Bun FFI or a small native helper), which removes
+the race between the check and the action. Add a test: plant a symlinked folder, push a
+remote change under it, and assert that nothing outside the root changed.
+
+## 3. Notice storm
+
+Each conflict copy made from this device's edit raises a 20 s notice, so item 1 produced
+7 stacked notices. Coalesce them: one notice per note, updated in place with a count,
+for example "3 conflict copies of BetterSync test.md".
+
+## 4. Smaller items
+
+- **No consistent backup command.** Copying `data/` while the server runs gives an
+  inconsistent SQLite snapshot. Add `bettersync backup <dest>`, using `VACUUM INTO` or the
+  backup API plus a manifest of referenced blobs, so a nightly cron job can take a
+  consistent copy.
+- **The first-start token goes to the container log,** where `docker logs` keeps it. Two
+  options: `serve` could write the first token to a 0600 file instead, or `init --token-file`
+  could exist. (The trial deployment avoided this by running `rotate-token`, with stdout
+  captured, before the first `serve`.)
+- **`bettersync.db` is created 0644.** It holds the token hash and every note's content,
+  so create the data directory 0700 and the files 0600.
+- **Document path-prefix deployments.** `https://host/bettersync` works, because the
+  plugin trims trailing slashes and nginx strips the prefix with
+  `location /bettersync/ { proxy_pass http://127.0.0.1:8787/; … }`. It is worth a line in
+  `deploy/nginx.conf`.
+- **Recovering a deleted conflict copy.** In the trial, all 7 copies were deleted,
+  including the newest. Until M4's history/restore exists, document how to get a deleted
+  version back from the change log and the blob store.
+
+## Not a bug, but trial feedback
+
+- Only `.md` syncs. The trial vault has 9 non-note files (images, a `.base`, an `.html`).
+  New pasted images not reaching other devices will be the first thing a daily user notices.
+  Consider whether attachments belong in M4 or later.
+
+## What worked
+
+- Initial upload of 240 notes; a throwaway client's full pull through nginx with live push.
+- Box → Windows within about 1 s.
+- **Typing on Line B on Windows while the box edited Line C four times:** merged cleanly,
+  including one stale-base push that the server merged three ways (changes 250–256). No
+  copies, and the cursor stayed put.
+- Deleting 7 notes and moving one into a new folder on Windows propagated. The box and
+  server then matched exactly: 241/241 notes, every hash equal.
