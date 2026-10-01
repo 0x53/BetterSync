@@ -7,8 +7,11 @@ export const MAX_NOTE_BYTES = 10 * 1024 * 1024;
 
 /** Characters Windows cannot store in a name (iOS and macOS also refuse ":"). */
 const NON_PORTABLE = /[<>:"|?*]/;
-/** Device names Windows reserves, with or without an extension. */
-const RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
+/** Device names Windows reserves, with or without an extension (and with spaces before it, which older Windows strips). */
+const RESERVED = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³]) *(?:\.|$)/i;
+/** Longest name ext4, APFS and iOS store, in UTF-8 bytes (NTFS allows 255 UTF-16 units, which is never less). */
+export const MAX_NAME_BYTES = 255;
+const utf8 = new TextEncoder();
 
 export function normalizePath(path: string): string {
   return path.normalize("NFC");
@@ -29,6 +32,7 @@ export function invalidPathReason(path: string): string | null {
   if (segments.some((s) => NON_PORTABLE.test(s))) return 'contains one of < > : " | ? *';
   if (segments.some((s) => s.endsWith(" ") || s.endsWith("."))) return "a name ends with a space or '.'";
   if (segments.some((s) => RESERVED.test(s))) return "a name Windows reserves (CON, NUL, COM1, ...)";
+  if (segments.some((s) => utf8.encode(s).length > MAX_NAME_BYTES)) return `a name is longer than ${MAX_NAME_BYTES} bytes`;
   return null;
 }
 
@@ -61,13 +65,31 @@ export function sameNoteName(a: string, b: string): boolean {
 /**
  * Name for the losing side of a conflict, next to the note:
  * "Folder/Note.md" → "Folder/Note (conflict 2026-09-30 laptop).md", with
- * " 2", " 3", ... appended if that key is taken.
+ * " 2", " 3", ... appended if that key is taken. A long name is shortened so
+ * the copy is still a valid path every device can store.
  */
 export function conflictCopyPath(path: string, date: string, device: string, taken: (key: string) => boolean): string {
-  const stem = path.slice(0, -".md".length);
-  const label = `conflict ${date} ${device.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "-")}`;
+  const slash = path.lastIndexOf("/");
+  const folder = path.slice(0, slash + 1);
+  const name = path.slice(slash + 1, -".md".length);
+  // eslint-disable-next-line no-control-regex
+  const label = `conflict ${date} ${[...normalizePath(device).replace(/[\\/:*?"<>|\u0000-\u001f\u007f]/g, "-")].slice(0, 64).join("")}`;
   for (let n = 1; ; n++) {
-    const candidate = `${stem} (${label}${n === 1 ? "" : ` ${n}`}).md`;
+    const suffix = ` (${label}${n === 1 ? "" : ` ${n}`}).md`;
+    const candidate = `${folder}${fitName(name, MAX_NAME_BYTES - utf8.encode(suffix).length)}${suffix}`;
     if (!taken(pathKey(candidate))) return candidate;
   }
+}
+
+/** `name` cut to at most `bytes` UTF-8 bytes on a character boundary, without a trailing space or dot. */
+function fitName(name: string, bytes: number): string {
+  let out = "";
+  let used = 0;
+  for (const ch of name) {
+    const n = utf8.encode(ch).length;
+    if (used + n > bytes) break;
+    out += ch;
+    used += n;
+  }
+  return out === name ? out : out.replace(/[ .]+$/, "");
 }

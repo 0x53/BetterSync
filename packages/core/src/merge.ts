@@ -9,7 +9,10 @@ import { diffLines, splitLines, type Hunk } from "./diff.ts";
  * text for it or only one side touches it, and conflicts otherwise. Two
  * insertions at the same point conflict (their order is ambiguous) unless they
  * are identical. Hunks that merely touch (one ends where the other starts)
- * do not conflict and are applied in base order.
+ * do not conflict and are applied in base order, except that an insertion
+ * the other side's touching replacement already holds at that edge is the
+ * same change made twice and is applied once (as when a client retries an
+ * edit it has since extended, after the server took the first try).
  *
  * The rules depend only on positions, never on which side a hunk came from,
  * so merge(base, a, b) and merge(base, b, a) always agree.
@@ -37,10 +40,10 @@ export function merge3(base: string, a: string, b: string): MergeResult {
   if (b === base) return { clean: true, text: a };
 
   const baseLines = splitLines(base);
-  const hunks: SideHunk[] = [
+  const hunks: SideHunk[] = absorbRepeats([
     ...diffLines(baseLines, splitLines(a)).map((h) => ({ ...h, side: 0 as const })),
     ...diffLines(baseLines, splitLines(b)).map((h) => ({ ...h, side: 1 as const })),
-  ];
+  ]);
   // By start; at the same start, pure insertions first so they precede a
   // replacement that begins there.
   hunks.sort((x, y) => x.start - y.start || (x.end - x.start === 0 ? 0 : 1) - (y.end - y.start === 0 ? 0 : 1));
@@ -85,6 +88,26 @@ export function merge3(base: string, a: string, b: string): MergeResult {
 
   if (conflicts.length > 0) return { clean: false, conflicts };
   return { clean: true, text: out.join("") };
+}
+
+/**
+ * Drops each pure insertion whose lines the other side's replacement touching
+ * it already contains, at the start (insertion at its start) or at the end
+ * (insertion at its end). Applying both would repeat those lines.
+ */
+function absorbRepeats(hunks: SideHunk[]): SideHunk[] {
+  const replacements = hunks.filter((h) => h.end > h.start);
+  return hunks.filter((ins) => {
+    if (ins.end !== ins.start) return true;
+    const p = ins.start;
+    const n = ins.lines.length;
+    return !replacements.some(
+      (r) =>
+        r.side !== ins.side &&
+        r.lines.length > n &&
+        ((r.start === p && sameLines(r.lines.slice(0, n), ins.lines)) || (r.end === p && sameLines(r.lines.slice(-n), ins.lines))),
+    );
+  });
 }
 
 /** One side's version of base[start, end), applying that side's hunks in the group. */

@@ -1,4 +1,4 @@
-import { rmSync } from "node:fs";
+import { Database } from "bun:sqlite";
 import * as fsp from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { StateStore } from "@bettersync/core";
@@ -21,7 +21,11 @@ export class FileStateStore implements StateStore {
   }
 
   async save(json: string): Promise<void> {
-    await fsp.mkdir(dirname(this.path), { recursive: true });
+    // Only the state folder itself: recreating a synced folder that went missing would make it look emptied.
+    await fsp.mkdir(dirname(this.path)).catch((e: NodeJS.ErrnoException) => {
+      if (e.code === "ENOENT") throw new Error(`${dirname(dirname(this.path))} is missing or not a folder`);
+      if (e.code !== "EEXIST") throw e;
+    });
     const tmp = `${this.path}.${process.pid}.tmp`;
     const fh = await fsp.open(tmp, "w", 0o600);
     try {
@@ -42,47 +46,36 @@ export function stateDir(folder: string): string {
 
 /**
  * One client per folder: two engines on one folder would each think the
- * other's writes are user edits. The lock file holds the owner's pid; a lock
- * whose process is gone (killed) is taken over.
+ * other's writes are user edits. The lock is an exclusive SQLite lock on
+ * `.bettersync/lock.db`, held by the open connection: the OS releases it
+ * when the process exits or is killed, so there is no stale lock to judge,
+ * and it holds across containers sharing the folder (pids would not).
  */
 export class FolderLock {
-  private constructor(readonly path: string) {}
+  private constructor(private readonly db: Database) {}
 
   static async acquire(folder: string): Promise<FolderLock> {
-    const path = join(stateDir(folder), "lock");
+    const path = join(stateDir(folder), "lock.db");
     await fsp.mkdir(dirname(path), { recursive: true });
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const fh = await fsp.open(path, "wx");
-        await fh.writeFile(String(process.pid));
-        await fh.close();
-        return new FolderLock(path);
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-      }
-      const pid = Number((await fsp.readFile(path, "utf8").catch(() => "")).trim());
-      if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && alive(pid)) {
-        throw new Error(`${folder} is already being synced by process ${pid}`);
-      }
-      await fsp.rm(path, { force: true });
+    const db = new Database(path, { create: true });
+    try {
+      db.run("PRAGMA busy_timeout = 0");
+      db.run("PRAGMA locking_mode = EXCLUSIVE");
+      // Never committed: the open transaction holds the lock for the process's lifetime.
+      db.run("BEGIN EXCLUSIVE");
+    } catch (e) {
+      db.close();
+      if ((e as { code?: string }).code?.startsWith("SQLITE_BUSY")) throw new Error(`${folder} is already being synced by another process`);
+      throw e;
     }
-    throw new Error(`could not lock ${folder}`);
+    return new FolderLock(db);
   }
 
   releaseSync(): void {
     try {
-      rmSync(this.path, { force: true });
+      this.db.close();
     } catch {
-      // Best effort; a stale lock is taken over next time.
+      // The OS drops the lock when the process ends anyway.
     }
-  }
-}
-
-function alive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return (e as NodeJS.ErrnoException).code === "EPERM";
   }
 }

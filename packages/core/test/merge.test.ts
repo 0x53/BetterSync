@@ -96,3 +96,22 @@ describe("mergeBytes", () => {
     expect(r.clean && [...r.bytes]).toEqual([...edited]);
   });
 });
+
+describe("merge3: one edit made twice", () => {
+  test("a retried edit that has since grown does not repeat the lines it shares", () => {
+    // v2 inserted "eggs"; v3 is v2 with the next line changed, sent again on base v1.
+    const base = "# Shopping\nmilk\nend\n";
+    const v2 = "# Shopping\neggs\nmilk\nend\n";
+    const v3 = "# Shopping\neggs\nmilk x2\nend\n";
+    expect(merge3(base, v2, v3)).toEqual({ clean: true, text: v3 });
+    expect(merge3(base, v3, v2)).toEqual({ clean: true, text: v3 });
+  });
+
+  test("the same at the end of a replacement", () => {
+    expect(merge3("a\nq\nc\n", "a\nq\nN\nc\n", "a\nQ\nN\nc\n")).toEqual({ clean: true, text: "a\nQ\nN\nc\n" });
+  });
+
+  test("an insertion next to a different change still merges", () => {
+    expect(merge3("a\nq\nc\n", "a\nN\nq\nc\n", "a\nQ\nc\n")).toEqual({ clean: true, text: "a\nN\nQ\nc\n" });
+  });
+});

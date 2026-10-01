@@ -61,7 +61,8 @@ export class ConcurrentChangeError extends Error {
 
 /**
  * The adapter cannot change this one file yet: an editor holds typing that
- * the change would clash with (the plugin). The engine keeps the server's
+ * the change would clash with (the plugin), or a folder on its path is a
+ * symlink, which the adapter will not write through. The engine keeps the server's
  * state pending, as it does for unsynced local content, and carries on with
  * the rest of the pass. Uncaught, it is a ConcurrentChangeError: retry soon.
  */
@@ -115,7 +116,15 @@ interface BaseEntry {
 
 interface ClientState {
   v: 1;
+  /** The server vault this state belongs to; versions and the cursor mean nothing on another. */
+  vault?: string;
   cursor: Seq;
+  /**
+   * The change at the cursor, as `markOf` prints it. Each pull reads it again:
+   * a server restored from a backup of its own data keeps its vault id, but
+   * no longer has this change (or has another one at its seq).
+   */
+  mark?: string;
   files: Record<string, BaseEntry>;
   /**
    * Newer server states not applied because the local file held unsynced
@@ -142,6 +151,8 @@ const TRANSFERS = 8;
 const PREFETCH_WINDOW = 64;
 /** Filesystem timestamps are coarse (ext4: a few ms; FAT: 2 s), so a stat this recent may hide an edit. */
 const RACY_MS = 2000;
+/** A pass that finds no notes at all where at least this many were synced refuses to delete them (an unmounted or emptied folder). */
+const MASS_DELETE = 10;
 
 interface Planned {
   op: Op;
@@ -198,15 +209,37 @@ export class SyncEngine {
       // They supersede anything pending, including keys they no longer list.
       const st = await this.deps.remote.state();
       this.state.pending = {};
+      if (st.vault !== undefined) this.state.vault = st.vault;
       const states: PathState[] = st.files.map((f) => ({ path: f.path, version: f.version, hash: f.hash }));
       await this.applyAll(states, (s) => s, (s) => this.applyRemote(s, report));
       this.state.cursor = st.seq;
     } else {
+      // The first page of a pull starts one change early, to check the change at the cursor.
+      let verify = this.state.mark !== undefined && this.state.cursor > 0;
       for (;;) {
-        const page = await this.deps.remote.changes(this.state.cursor);
-        await this.applyAll(page.changes, (c) => ({ path: c.path, version: c.seq, hash: c.hash }), async (c) => {
+        const known = verify;
+        verify = false;
+        const page = await this.deps.remote.changes(known ? this.state.cursor - 1 : this.state.cursor);
+        let changes = page.changes;
+        let other = (page.vault !== undefined && this.state.vault !== undefined && page.vault !== this.state.vault) || page.seq < this.state.cursor;
+        if (known && !other) {
+          if (changes[0]?.seq === this.state.cursor && markOf(changes[0]) === this.state.mark) changes = changes.slice(1);
+          else other = true;
+        }
+        if (other) {
+          // Another server, or this one restored from a backup: its versions are not the ones this
+          // state recorded, and a stale base could delete newer work. Start over as if the state
+          // were lost; local files are kept and compared with the server's.
+          this.deps.log?.(`server ${page.vault ?? "?"} at seq ${page.seq} is not the one this state was synced with (${this.state.vault ?? "?"} at ${this.state.cursor}); resyncing from scratch`);
+          this.state = { v: 1, cursor: 0, files: {}, pending: {} };
+          this.acked.clear();
+          return this.pull(report);
+        }
+        if (page.vault !== undefined) this.state.vault = page.vault;
+        await this.applyAll(changes, (c) => ({ path: c.path, version: c.seq, hash: c.hash }), async (c) => {
           await this.applyChange(c, report);
           this.state.cursor = c.seq;
+          this.state.mark = markOf(c);
         });
         await this.save();
         if (page.changes.length === 0 || this.state.cursor >= page.seq) break;
@@ -365,9 +398,16 @@ export class SyncEngine {
     await this.separateCaseTwins();
 
     const locals = new Map<string, { path: string; hash: BlobHash; bytes?: Uint8Array }>();
+    const tooLarge = new Set<string>();
     for (const [key, [path]] of this.names) {
       const st = await this.deps.fs.stat(path!);
-      if (!st || st.size > MAX_NOTE_BYTES) continue;
+      if (!st) continue;
+      if (st.size > MAX_NOTE_BYTES) {
+        // Not sent, but present: a synced note that outgrew the limit must not read as deleted.
+        tooLarge.add(key);
+        this.deps.log?.(`not syncing ${st.path}: over ${MAX_NOTE_BYTES} bytes`);
+        continue;
+      }
       const base = this.state.files[key];
       if (base?.hash && !base.racy && sameNoteName(base.path, st.path) && base.mtime === st.mtime && base.size === st.size) {
         locals.set(key, { path: st.path, hash: base.hash });
@@ -398,8 +438,11 @@ export class SyncEngine {
       }
     }
     const deleted = Object.entries(this.state.files)
-      .filter(([key, b]) => b.hash !== null && !locals.has(key))
+      .filter(([key, b]) => b.hash !== null && !locals.has(key) && !tooLarge.has(key))
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    if (this.names.size === 0 && deleted.length >= MASS_DELETE) {
+      throw new Error(`the folder holds no notes but ${deleted.length} were synced; refusing to delete them all (is it unmounted or replaced?). Delete them in smaller steps if this is intended.`);
+    }
     for (const [, base] of deleted) {
       // A note that vanished while an identical one appeared elsewhere was moved.
       const i = created.findIndex((k) => locals.get(k)!.hash === base.hash);
@@ -433,7 +476,12 @@ export class SyncEngine {
     if (!base || base.hash !== null || base.prev !== hash || base.mtime === undefined) return false;
     const st = await this.deps.fs.stat(path);
     if (!st || st.mtime !== base.mtime || st.size !== base.size || (await this.readHash(st.path)) !== hash) return false;
-    await this.deps.fs.remove(st.path);
+    try {
+      await this.deps.fs.remove(st.path);
+    } catch (e) {
+      if (!(e instanceof LocalBusyError)) throw e;
+      // Open with typing: not sent this pass, looked at again next pass.
+    }
     return true;
   }
 
@@ -453,7 +501,11 @@ export class SyncEngine {
         const h = await this.readHash(name);
         if (h === null) continue;
         if (this.acked.get(key)?.has(h) || h === base?.hash) {
-          await this.deps.fs.remove(name);
+          try {
+            await this.deps.fs.remove(name);
+          } catch (e) {
+            if (!(e instanceof LocalBusyError)) throw e;
+          }
         } else {
           const date = new Date(this.deps.now()).toISOString().slice(0, 10);
           const to = conflictCopyPath(name, date, this.deps.device, (k) => this.names.has(k) || k in this.state.files);
@@ -493,6 +545,17 @@ export class SyncEngine {
         }
         if (r.conflictPath !== undefined) report.conflicts.push(r.conflictPath);
         for (const s of r.files) await this.applyRemote(s, report);
+        if (p.op.op === "put" && p.ack) {
+          // The server now holds exactly what was sent, but the file changed again during the round
+          // trip, so applyRemote kept the old base. That content is the new base: a next put based
+          // on the old one would have the server merge this device's two saves (or conflict them).
+          const key = p.ack.key;
+          const s = r.files.find((f) => pathKey(f.path) === key);
+          if (s && s.hash === p.op.hash && this.isNewer(key, s.version)) {
+            this.setBase(key, { path: s.path, version: s.version, hash: s.hash });
+            if ((this.state.pending[key]?.version ?? Infinity) <= s.version) delete this.state.pending[key];
+          }
+        }
       }
       await this.save();
     }
@@ -538,7 +601,13 @@ export class SyncEngine {
   private async renameLocal(from: string, to: string): Promise<boolean> {
     const target = await this.deps.fs.stat(to);
     if (target && target.path !== from) return false;
-    await this.deps.fs.rename(from, to);
+    try {
+      await this.deps.fs.rename(from, to);
+    } catch (e) {
+      if (!(e instanceof LocalBusyError)) throw e;
+      this.deps.log?.(`waiting: ${e.message}`);
+      return false;
+    }
     return true;
   }
 
@@ -584,6 +653,11 @@ async function mapLimit<T>(items: readonly T[], limit: number, fn: (item: T) => 
   };
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   if (failure) throw failure.error;
+}
+
+/** What identifies a change across a restore: the same seq on a restored server is a different write. */
+function markOf(c: Change): string {
+  return `${c.seq} ${c.time} ${c.device} ${c.op} ${c.hash ?? "-"}`;
 }
 
 function parseState(json: string | null): ClientState {

@@ -27,11 +27,17 @@ export interface FileRow {
 
 /** Storage behind a Vault. Synchronous so the SQLite store can use bun:sqlite directly. */
 export interface VaultStore {
+  /** A random id fixed when the store was created. */
+  vaultId(): string;
   seq(): Seq;
   row(key: string): FileRow | undefined;
   liveRows(): FileRow[];
   change(seq: Seq): Change | undefined;
   changesAfter(after: Seq, limit: number): Change[];
+  /** Changes whose (destination) path has key `key`, with seq > after, in order. */
+  changesOn(key: string, after: Seq): Change[];
+  /** Whether a live note's key starts with `prefix` (a folder key ending in "/"). */
+  hasLiveUnder(prefix: string): boolean;
   /** Whether `hash` was a version of, or was submitted for, `key` in a change with seq > after. */
   seenAfter(key: string, after: Seq, hash: BlobHash): boolean;
   hasBlob(hash: BlobHash): boolean;
@@ -63,11 +69,11 @@ export class Vault {
 
   state(): StateResponse {
     const files: FileEntry[] = this.store.liveRows().map((r) => ({ path: r.path, hash: r.hash!, size: r.size, mtime: r.mtime, version: r.version }));
-    return { seq: this.store.seq(), files };
+    return { vault: this.store.vaultId(), seq: this.store.seq(), files };
   }
 
   changes(after: Seq, limit = CHANGES_PAGE): ChangesResponse {
-    return { changes: this.store.changesAfter(after, limit), seq: this.store.seq() };
+    return { vault: this.store.vaultId(), changes: this.store.changesAfter(after, limit), seq: this.store.seq() };
   }
 
   hasBlob(hash: BlobHash): boolean {
@@ -99,6 +105,8 @@ export class Vault {
   private async applyOp(device: string, op: Op): Promise<OpResult> {
     const bad = op.op === "move" ? (invalidPathReason(op.from) ?? invalidPathReason(op.to)) : invalidPathReason(op.path);
     if (bad) return { status: "rejected", reason: bad };
+    const clash = op.op === "delete" ? null : this.folderClash(op.op === "move" ? op.to : op.path);
+    if (clash) return { status: "rejected", reason: clash };
     const tx = new Tx(this.store, device, this.deps.now());
     let result: OpResult;
     switch (op.op) {
@@ -128,12 +136,7 @@ export class Vault {
       tx.write(key, { op: "put", path: live?.path ?? path, hash, size: bytes.length, baseVersion: base });
       return tx.result("accepted", [key]);
     }
-    // Base is stale. Content this key has already seen since the base is a
-    // replay (a retry after a lost response or a crash) or, with no base, a
-    // stale copy from a device that lost its state: the server has it already.
-    if (this.store.seenAfter(key, base ?? 0, hash)) return tx.result("unchanged", [key]);
-
-    // Follow the note if it was moved after the base, so the edit lands where it went.
+    // Base is stale. Follow the note if it was moved after the base, so the edit lands where it went.
     let target = key;
     const touched = [key];
     for (let hop = 0; hop < MAX_MOVE_HOPS; hop++) {
@@ -142,6 +145,11 @@ export class Vault {
       target = pathKey(r.movedTo);
       touched.push(target);
     }
+    // Content the note has already seen since the base, here or where it moved, is a replay
+    // (a retry after a lost response or a crash) or, with no base, a stale copy from a device
+    // that lost its state: the server has it already.
+    if (touched.some((k) => this.store.seenAfter(k, base ?? 0, hash))) return tx.result("unchanged", touched);
+
     const cur = tx.row(target);
     if (cur?.hash == null) {
       // Deleted after the base (or created fresh on a device that never saw it): the edit wins.
@@ -189,12 +197,50 @@ export class Vault {
     return tx.result("accepted", dest === to ? [fromKey, toKey] : [fromKey, toKey, destKey]);
   }
 
-  /** Content of the note at version `base`, if that change belongs to one of `keys`; else empty. */
+  /**
+   * Content of the note at version `base`, if that change belongs to one of
+   * `keys` (the note's path, then each place it moved to) and the note now at
+   * the end of that chain descends from it; else empty, so the edit merges
+   * only if the two versions do not overlap at all, and is otherwise kept as
+   * a conflict copy. A note deleted and created anew, a note created where
+   * this one moved away, or another note moved in, is not a descendant:
+   * merging against the old content would splice an edit into a stranger.
+   */
   private contentAt(base: Seq | null, keys: readonly string[]): Uint8Array {
     if (base === null) return new Uint8Array();
     const c = this.store.change(base);
     if (!c?.hash || !keys.includes(pathKey(c.path))) return new Uint8Array();
+    if (!this.descends(base, keys)) return new Uint8Array();
     return this.store.blob(c.hash) ?? new Uint8Array();
+  }
+
+  private descends(base: Seq, keys: readonly string[]): boolean {
+    // The note sat at keys[i] from its move there (the tombstone it left at keys[i-1] has that
+    // move's seq) until its move on to keys[i+1]; only changes in that window are its history.
+    const arrived = keys.map((_, i) => (i === 0 ? base : (this.store.row(keys[i - 1]!)?.version ?? base)));
+    for (const [i, k] of keys.entries()) {
+      const left = arrived[i + 1] ?? Infinity;
+      for (const c of this.store.changesOn(k, arrived[i]!)) {
+        if (c.seq >= left) break;
+        if (c.op === "delete") return false;
+        if (c.op === "move" && pathKey(c.from!) !== k) return false;
+        if (c.op === "put" && c.baseVersion !== null) {
+          // Accepted onto an empty path: the key held no note when this was written.
+          const prev = this.store.change(c.baseVersion);
+          if (prev && ((prev.op === "delete" && pathKey(prev.path) === k) || (prev.op === "move" && pathKey(prev.from!) === k && pathKey(prev.path) !== k))) return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /** Why `path` cannot hold a note because a note and a folder would share a name, or null. */
+  private folderClash(path: string): string | null {
+    const key = pathKey(path);
+    for (let i = key.indexOf("/"); i !== -1; i = key.indexOf("/", i + 1)) {
+      if (this.store.row(key.slice(0, i))?.hash != null) return `folder ${path.slice(0, i)} is a note`;
+    }
+    return this.store.hasLiveUnder(`${key}/`) ? "a folder has this name" : null;
   }
 }
 
@@ -261,10 +307,16 @@ class Tx {
 
 /** In-memory VaultStore for tests and the simulator. */
 export class MemoryVaultStore implements VaultStore {
+  constructor(private readonly id = "memory") {}
+
   private readonly log: Change[] = [];
   private readonly rows = new Map<string, FileRow>();
   private readonly seen = new Map<string, { seq: Seq; hash: BlobHash }[]>();
   private readonly blobs = new Map<BlobHash, Uint8Array>();
+
+  vaultId(): string {
+    return this.id;
+  }
 
   seq(): Seq {
     return this.log.length;
@@ -285,6 +337,15 @@ export class MemoryVaultStore implements VaultStore {
 
   changesAfter(after: Seq, limit: number): Change[] {
     return this.log.slice(after, after + limit);
+  }
+
+  changesOn(key: string, after: Seq): Change[] {
+    return this.log.slice(after).filter((c) => pathKey(c.path) === key);
+  }
+
+  hasLiveUnder(prefix: string): boolean {
+    for (const [key, r] of this.rows) if (r.hash !== null && key.startsWith(prefix)) return true;
+    return false;
   }
 
   seenAfter(key: string, after: Seq, hash: BlobHash): boolean {

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ConcurrentChangeError, MemoryVaultStore, SyncEngine, Vault, type LocalFs, type Remote } from "@bettersync/core";
+import { ConcurrentChangeError, LocalBusyError, MemoryVaultStore, SyncEngine, Vault, type LocalFs, type Remote } from "@bettersync/core";
 import { SimFs, type Clobber } from "@bettersync/sim";
 import { ObsidianFs } from "../src/obsidian-fs.ts";
 import { FakeVault, obsidianFs } from "./fake-vault.ts";
@@ -295,4 +295,48 @@ test("engine: a server that lacks a blob it was said to have still gets it", asy
   const r = await engine.sync();
   expect(r.rejected).toEqual([]);
   expect(serverTexts(server).get("Note.md")).toBe("x\n");
+});
+
+describe("adapter safety nets", () => {
+  test("creating a note never replaces a file on disk the vault index does not list yet", async () => {
+    const d = disk(false);
+    const { fs, vault } = obsidianFs(d.fs, d.view);
+    d.fs.userWrite("X.md", enc.encode("written by another app\n"));
+    // Obsidian's watcher has not caught up: the index does not know the file.
+    const real = vault.getAbstractFileByPath.bind(vault);
+    vault.getAbstractFileByPath = (p) => (p === "X.md" ? null : real(p));
+    const files = vault.getFiles.bind(vault);
+    vault.getFiles = () => files().filter((f) => f.path !== "X.md");
+    await expect(fs.write("X.md", enc.encode("from the server\n"))).rejects.toBeInstanceOf(ConcurrentChangeError);
+    expect(dec.decode(d.fs.get("X.md")!.bytes)).toBe("written by another app\n");
+  });
+
+  test("an editor whose saved text Obsidian does not expose is never written through", async () => {
+    const d = disk(false);
+    const { fs, vault } = obsidianFs(d.fs, d.view);
+    d.fs.userWrite("N.md", enc.encode("a\nb\n"));
+    await fs.list();
+    await fs.read("N.md");
+    const ed = vault.open("N.md");
+    ed.savedText = () => null as never;
+    ed.type("a\nb\ntyping\n");
+    await expect(fs.write("N.md", enc.encode("A\nb\n"))).rejects.toBeInstanceOf(LocalBusyError);
+    expect(ed.text()).toBe("a\nb\ntyping\n");
+    expect(fs.isBusy("N.md")).toBe(true);
+    fs.clearBusy("N.md");
+    expect(fs.isBusy("N.md")).toBe(false);
+  });
+
+  test("a change merged into an editor with typing reports a stat the engine cannot cache", async () => {
+    const d = disk(false);
+    const { fs, vault } = obsidianFs(d.fs, d.view);
+    d.fs.userWrite("N.md", enc.encode("a\nb\nc\n"));
+    await fs.list();
+    await fs.read("N.md");
+    const ed = vault.open("N.md");
+    ed.type("a\nb\nc\ntyping\n");
+    const st = await fs.write("N.md", enc.encode("A\nb\nc\n"));
+    expect(ed.text()).toBe("A\nb\nc\ntyping\n");
+    expect(st.mtime).toBe(-1);
+  });
 });

@@ -1,5 +1,7 @@
-# The headless client in Docker, keeping ./vault in sync; mount the same
-# folder into the agent's container.
+# The headless client in Docker, keeping ./vault (next to this file) in sync;
+# mount the same folder into the agent's container. Create it first and give
+# it to uid 1000, or Docker creates it owned by root and the client cannot write:
+#   mkdir -p deploy/vault && sudo chown 1000:1000 deploy/vault
 #   BETTERSYNC_TOKEN=... docker compose -f deploy/headless-compose.yml up -d
 services:
   bettersync-agent:

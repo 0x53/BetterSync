@@ -49,6 +49,8 @@ export class Runner {
   private debounce: ReturnType<typeof setTimeout> | undefined;
   private burstStart = 0;
   private failures = 0;
+  /** Until when a failed pass's backoff holds back passes that local changes and the rescan ask for. */
+  private backoffUntil = 0;
   private ws: WebSocket | undefined;
   private liveRetry: ReturnType<typeof setTimeout> | undefined;
   private liveFailures = 0;
@@ -83,7 +85,7 @@ export class Runner {
     this.paused = true;
     this.suspendLoops();
     await this.running;
-    this.setStatus("paused");
+    if (this.paused) this.setStatus("paused");
   }
 
   resume(): void {
@@ -99,6 +101,7 @@ export class Runner {
   wake(): void {
     if (!this.active) return;
     this.failures = 0;
+    this.backoffUntil = 0;
     this.liveFailures = 0;
     if (this.ws?.readyState !== WebSocket.OPEN) {
       this.ws?.close();
@@ -159,7 +162,11 @@ export class Runner {
   private setStatus(s: RunnerStatus): void {
     if (s === this.current) return;
     this.current = s;
-    this.o.onStatus?.(s);
+    try {
+      this.o.onStatus?.(s);
+    } catch (e) {
+      this.o.log(`status handler failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   // ---- live ----
@@ -183,7 +190,8 @@ export class Runner {
     ws.onopen = () => {
       this.liveFailures = 0;
       last = Date.now();
-      this.kick(0);
+      // The server answers again: no reason to sit out an offline backoff.
+      this.kick(0, true);
     };
     ws.onmessage = (m) => {
       last = Date.now();
@@ -193,7 +201,7 @@ export class Runner {
       } catch {
         return;
       }
-      if (msg.type === "change" && msg.change.seq > this.o.engine.cursor) this.kick(0);
+      if (msg.type === "change" && msg.change.seq > this.o.engine.cursor) this.kick(0, true);
     };
     ws.onclose = () => {
       clearInterval(heartbeat);
@@ -212,7 +220,11 @@ export class Runner {
       if (delay === 0) this.dirty = true;
       return;
     }
-    const at = Date.now() + delay;
+    const now = Date.now();
+    // Offline or a rejected token: edits keep coming, but they wait out the backoff like the retry does.
+    if (!force && now + delay < this.backoffUntil) delay = this.backoffUntil - now;
+    if (force) this.backoffUntil = 0;
+    const at = now + delay;
     if (at >= this.timerAt && !force) return;
     clearTimeout(this.timer);
     this.timerAt = at;
@@ -220,15 +232,20 @@ export class Runner {
       this.timer = undefined;
       this.timerAt = Infinity;
       this.setStatus("syncing");
-      this.running = this.pass().then((retry) => {
-        this.running = null;
-        if (this.paused) this.setStatus("paused");
-        // After a failure the retry waits out its backoff, whatever arrived meanwhile.
-        if (retry !== undefined) this.kick(retry);
-        else if (this.dirty) this.kick(0);
-        this.dirty = false;
-        if (this.timerAt === Infinity) this.notifyIdle();
-      });
+      this.running = this.pass()
+        .catch((e: unknown) => {
+          this.o.log(`pass error: ${e instanceof Error ? e.message : String(e)}`);
+          return 1000;
+        })
+        .then((retry) => {
+          this.running = null;
+          if (this.paused) this.setStatus("paused");
+          // After a failure the retry waits out its backoff, whatever arrived meanwhile.
+          if (retry !== undefined) this.kick(retry);
+          else if (this.dirty) this.kick(0);
+          this.dirty = false;
+          if (this.timerAt === Infinity) this.notifyIdle();
+        });
     }, delay);
   }
 
@@ -242,12 +259,12 @@ export class Runner {
       await this.o.beforePass?.();
       const r = await this.o.engine.sync();
       this.failures = 0;
+      this.backoffUntil = 0;
       this.passes++;
       this.setStatus("synced");
       this.report(r);
       return undefined;
     } catch (e) {
-      this.failures++;
       let delay: number;
       if (e instanceof ConcurrentChangeError) {
         delay = 500;
@@ -255,10 +272,13 @@ export class Runner {
         this.setStatus("syncing");
       } else if (e instanceof HttpError && e.status === 401) {
         delay = 60_000;
+        this.backoffUntil = Date.now() + delay;
         this.o.log("the server rejected the token");
         this.setStatus("unauthorized");
       } else {
-        delay = backoff(this.failures - 1, 60_000);
+        // A file changing under a pass is not the network failing: only real failures grow the backoff.
+        delay = backoff(this.failures++, 60_000);
+        this.backoffUntil = Date.now() + delay;
         this.o.log(`sync failed (${e instanceof Error ? e.message : String(e)}); retrying in ${Math.round(delay / 1000)} s`);
         this.setStatus("offline");
       }
@@ -270,7 +290,11 @@ export class Runner {
     if (r.applied > 0 || r.pushed > 0) this.o.log(`synced: ${r.applied} applied, ${r.pushed} pushed, cursor ${this.o.engine.cursor}`);
     for (const c of r.conflicts) this.o.log(`conflict: kept the other version; this device's edit is in ${c}`);
     for (const x of r.rejected) this.o.log(`rejected by the server: ${JSON.stringify(x.op)}: ${x.reason}`);
-    this.o.onReport?.(r);
+    try {
+      this.o.onReport?.(r);
+    } catch (e) {
+      this.o.log(`report handler failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 }
 

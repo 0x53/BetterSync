@@ -60,7 +60,7 @@ export class ServerProc {
 
   /** Creates the vault and its token through the admin CLI. */
   async init(): Promise<void> {
-    const p = Bun.spawn([process.execPath, SERVER_CLI, "rotate-token", "--data", this.dataDir], { stdout: "pipe", stderr: "pipe" });
+    const p = Bun.spawn([process.execPath, SERVER_CLI, "rotate-token", "--init", "--data", this.dataDir], { stdout: "pipe", stderr: "pipe" });
     this.token = (await new Response(p.stdout).text()).trim();
     if ((await p.exited) !== 0 || !/^[0-9a-f]{64}$/.test(this.token)) throw new Error(`rotate-token failed: ${this.token}`);
   }

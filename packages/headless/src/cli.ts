@@ -37,16 +37,23 @@ interface Config {
 const log = (m: string) => console.log(`${new Date().toISOString()} ${m}`);
 
 async function main(argv: string[]): Promise<number | undefined> {
-  const { values, positionals } = parseArgs({
-    args: argv,
-    options: {
-      server: { type: "string" },
-      device: { type: "string" },
-      config: { type: "string" },
-      help: { type: "boolean", short: "h" },
-    },
-    allowPositionals: true,
-  });
+  let parsed;
+  try {
+    parsed = parseArgs({
+      args: argv,
+      options: {
+        server: { type: "string" },
+        device: { type: "string" },
+        config: { type: "string" },
+        help: { type: "boolean", short: "h" },
+      },
+      allowPositionals: true,
+    });
+  } catch (e) {
+    console.error(`${(e as Error).message}\n\n${USAGE}`);
+    return 2;
+  }
+  const { values, positionals } = parsed;
   const [command, folderArg] = positionals;
   if (values.help || (command !== "sync" && command !== "once") || folderArg === undefined || positionals.length > 2) {
     (values.help ? console.log : console.error)(USAGE);

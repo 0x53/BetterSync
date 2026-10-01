@@ -1,13 +1,15 @@
 #!/usr/bin/env bun
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { generateToken, hasToken, setToken, startServer } from "./app.ts";
-import { SqliteVaultStore } from "./store.ts";
+import { DB_FILE, SqliteVaultStore } from "./store.ts";
 
 /**
  * The server's admin CLI (design doc, "Operations"):
  *
  *   bettersync serve [--data DIR] [--port N] [--host ADDR]
- *   bettersync rotate-token [--data DIR]
+ *   bettersync rotate-token [--data DIR] [--init]   --init: create the vault if there is none
  *   bettersync healthcheck [--port N]       exit 0 if the server answers /healthz
  *
  * Settings also come from BETTERSYNC_DATA, BETTERSYNC_PORT and
@@ -16,7 +18,7 @@ import { SqliteVaultStore } from "./store.ts";
 
 const USAGE = `usage:
   bettersync serve [--data DIR] [--port N] [--host ADDR]
-  bettersync rotate-token [--data DIR]
+  bettersync rotate-token [--data DIR] [--init]
   bettersync healthcheck [--port N]
 
 environment: BETTERSYNC_DATA (default ./data), BETTERSYNC_PORT (default 8787),
@@ -29,6 +31,7 @@ async function main(argv: string[]): Promise<number | undefined> {
       data: { type: "string" },
       port: { type: "string" },
       host: { type: "string" },
+      init: { type: "boolean" },
       help: { type: "boolean", short: "h" },
     },
     allowPositionals: true,
@@ -39,8 +42,15 @@ async function main(argv: string[]): Promise<number | undefined> {
     return values.help ? 0 : 2;
   }
   const dataDir = values.data ?? process.env.BETTERSYNC_DATA ?? "./data";
+  // The database and blobs are the whole vault in plain text: owner only.
+  process.umask(0o077);
 
   if (command === "rotate-token") {
+    // A mistyped --data must not create an empty vault whose token the running server never sees.
+    if (!values.init && !existsSync(join(dataDir, DB_FILE))) {
+      console.error(`no vault in ${dataDir} (pass --data or set BETTERSYNC_DATA; --init creates one)`);
+      return 2;
+    }
     const store = new SqliteVaultStore(dataDir);
     const token = generateToken();
     setToken(store, token);
@@ -72,6 +82,11 @@ async function main(argv: string[]): Promise<number | undefined> {
   }
 
   const store = new SqliteVaultStore(dataDir);
+  // One server per data directory, held before cleanTemp, which would delete a running server's in-flight blobs.
+  if (!store.lockExclusive()) {
+    console.error(`another server is already running on ${dataDir}`);
+    return 1;
+  }
   const cleaned = store.cleanTemp();
   if (!hasToken(store)) {
     const token = generateToken();

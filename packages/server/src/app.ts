@@ -123,8 +123,13 @@ export function startServer(opts: ServerOptions): RunningServer {
         if (url.pathname === "/v1/ops" && req.method === "POST") {
           const ops = parseOps(await req.json().catch(() => undefined));
           if (typeof ops === "string") return text(400, ops);
-          const res = await vault.applyOps(device, ops);
-          publish();
+          let res;
+          try {
+            res = await vault.applyOps(device, ops);
+          } finally {
+            // Ops before a failure in the batch committed; live clients hear of them now either way.
+            publish();
+          }
           for (const [i, r] of res.results.entries()) {
             if (r.status !== "accepted" && r.status !== "unchanged") log(`${device}: ${describeOp(ops[i]!)} -> ${r.status}${"conflictPath" in r && r.conflictPath ? ` (${r.conflictPath})` : ""}${r.status === "rejected" ? `: ${r.reason}` : ""}`);
           }
@@ -161,6 +166,8 @@ export function startServer(opts: ServerOptions): RunningServer {
     const protocols = (req.headers.get("Sec-WebSocket-Protocol") ?? "").split(",").map((p) => p.trim());
     const fromProtocol = protocols.find((p) => p.startsWith(TOKEN_PROTOCOL))?.slice(TOKEN_PROTOCOL.length) ?? null;
     if (!authorized(bearer(req) ?? fromProtocol)) return text(401, "bad token");
+    // Accepting the token as the subprotocol would echo it back in the handshake response.
+    if (bearer(req) === null && !protocols.includes(LIVE_PROTOCOL)) return text(400, `offer the "${LIVE_PROTOCOL}" subprotocol with the token`);
     const device = deviceName(req.headers.get(DEVICE_HEADER) ?? url.searchParams.get("device"));
     if (device === null) return text(400, "missing or invalid device name");
     // Bun refuses an empty headers object, so it is passed only when there is a protocol to accept.
@@ -192,7 +199,7 @@ function bearer(req: Request): string | null {
 /** A self-chosen label for history and conflict copies: 1–64 printable characters. */
 function deviceName(raw: string | null): string | null {
   if (raw === null) return null;
-  const name = raw.trim();
+  const name = raw.trim().normalize("NFC");
   // eslint-disable-next-line no-control-regex
   if (name.length === 0 || name.length > MAX_DEVICE || /[\u0000-\u001f\u007f]/.test(name)) return null;
   return name;
@@ -233,7 +240,8 @@ function describeOp(op: Op): string {
 }
 
 function json(value: unknown): Response {
-  return Response.json(value);
+  // State and changes go stale at once; nothing between here and the client may answer from a cache.
+  return Response.json(value, { headers: { "Cache-Control": "no-store" } });
 }
 
 function text(status: number, body: string): Response {

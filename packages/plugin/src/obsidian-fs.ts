@@ -36,8 +36,12 @@ export interface OpenNote {
   save(): Promise<void>;
   /** The editor's text, typing included. */
   text(): string;
-  /** The text the editor last loaded or saved: what Obsidian merges its typing from. */
-  savedText(): string;
+  /**
+   * The text the editor last loaded or saved: what Obsidian merges its typing
+   * from. Null if this Obsidian does not expose it; such an editor's note is
+   * then never written while it is open.
+   */
+  savedText(): string | null;
   /** Replaces the editor's text in one synchronous step that keeps the cursor, as if typed. */
   setText(text: string): void;
 }
@@ -108,6 +112,11 @@ export class ObsidianFs implements LocalFs {
     return this.busy.has(pathKey(path));
   }
 
+  /** The note's editors hold no typing (it was saved): a change that waited on it no longer does. */
+  clearBusy(path: string): void {
+    this.busy.delete(pathKey(path));
+  }
+
   async list(): Promise<LocalStat[]> {
     const files = this.vault.getFiles();
     this.rebuild(files);
@@ -155,12 +164,18 @@ export class ObsidianFs implements LocalFs {
     await this.checkUnchanged(existing?.path ?? null, path);
     const data = toArrayBuffer(bytes);
     let f: VaultFile;
+    let typingKept = false;
     if (existing) {
       // Keeps the existing name (folder case included), like a save in an editor.
-      if (!(await this.writeThroughEditors(existing, path, bytes))) await this.vault.modifyBinary(existing, data);
+      const merged = await this.writeThroughEditors(existing, path, bytes);
+      if (merged === null) await this.vault.modifyBinary(existing, data);
+      typingKept = merged === "typing kept";
       f = existing;
     } else {
       const target = await this.prepareFolders(path);
+      // The index lags the disk (a file another program just wrote; on iOS until the next rescan),
+      // and creating over a file Obsidian does not know about would replace it.
+      if (await this.vault.adapter.stat(target)) throw new ConcurrentChangeError(path, "exists on disk but not yet in the vault index");
       try {
         f = await this.vault.createBinary(target, data);
       } catch (e) {
@@ -171,7 +186,9 @@ export class ObsidianFs implements LocalFs {
     }
     this.busy.delete(pathKey(path));
     this.seen.set(f.path, await this.diskSig(f.path));
-    return toStat(f);
+    // The file holds the change plus the typing, not the bytes the engine wrote: a stat it can
+    // never match, so the next pass rehashes the note and pushes the typing (coarse mtimes included).
+    return typingKept ? { ...toStat(f), mtime: -1 } : toStat(f);
   }
 
   async remove(path: string): Promise<void> {
@@ -328,27 +345,32 @@ export class ObsidianFs implements LocalFs {
    * If typing overlaps the change, nothing changes and the note is busy.
    *
    * The file then holds the new text plus the typing, while the engine
-   * records the new text: its stat is racy (just written), so the next pass
-   * rehashes, finds the typing, and pushes it as a local edit.
+   * records the new text; "typing kept" tells write to report a stat the
+   * engine will not trust, so the next pass rehashes, finds the typing, and
+   * pushes it as a local edit. Null if no editor shows the note.
    */
-  private async writeThroughEditors(file: VaultFile, path: string, bytes: Uint8Array): Promise<boolean> {
+  private async writeThroughEditors(file: VaultFile, path: string, bytes: Uint8Array): Promise<"merged" | "typing kept" | null> {
     const notes = this.openNotes(file.path);
-    if (notes.length === 0) return false;
+    if (notes.length === 0) return null;
     const incoming = decodeUtf8(bytes);
     // The editor turns CRLF into LF and cannot hold other bytes: write the file, if no typing is at stake.
     if (incoming === null || incoming.includes("\r")) {
       this.checkEditors(file.path, path, bytes);
-      return false;
+      return null;
     }
     // From here to setText nothing awaits, so no keystroke can come between the merge and its result.
-    const merged = notes.map((n) => merge3(n.savedText(), n.text(), incoming));
+    const merged = notes.map((n) => {
+      const saved = n.savedText();
+      return saved === null ? ({ clean: false } as const) : merge3(saved, n.text(), incoming);
+    });
     if (merged.some((m) => !m.clean)) {
       this.busy.add(pathKey(path));
       throw new LocalBusyError(path, "has unsaved typing that overlaps the incoming change");
     }
-    notes.forEach((n, i) => n.setText((merged[i] as { text: string }).text));
+    const texts = merged.map((m) => (m as { text: string }).text);
+    notes.forEach((n, i) => n.setText(texts[i]!));
     for (const n of notes) await n.save();
-    return true;
+    return texts.every((t) => t === incoming) ? "merged" : "typing kept";
   }
 
   /**
@@ -359,7 +381,8 @@ export class ObsidianFs implements LocalFs {
     for (const n of this.openNotes(actual)) {
       if (!n.dirty) continue;
       const incoming = next === null ? null : decodeUtf8(next);
-      if (incoming !== null && !incoming.includes("\r") && merge3(n.savedText(), n.text(), incoming).clean) continue;
+      const saved = n.savedText();
+      if (incoming !== null && saved !== null && !incoming.includes("\r") && merge3(saved, n.text(), incoming).clean) continue;
       this.busy.add(pathKey(path));
       throw new LocalBusyError(path, next === null ? "is open with unsaved typing" : "has unsaved typing that overlaps the incoming change");
     }

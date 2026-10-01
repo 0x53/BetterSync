@@ -63,14 +63,14 @@ bettersync sync ~/vault --server https://notes.example.com --device agent-1   # 
 bettersync once ~/vault --server https://notes.example.com --device cron      # pull, push, exit
 ```
 
-Settings can also live in `~/.config/bettersync/config.json` (`{"server", "token", "device"}`). The folder's sync state and lock are in `<folder>/.bettersync/`; only one client may sync a folder at a time.
+Settings can also live in `~/.config/bettersync/config.json` (`{"server", "token", "device"}`). The folder's sync state and lock are in `<folder>/.bettersync/`; only one client may sync a folder at a time (an OS-held lock, released when the process dies, and effective across containers sharing the folder).
 
 ## Merge (`packages/core/src/merge.ts`)
 
 Line-based three-way merge with no conflict markers. On conflict, the caller keeps the server's version and saves the other version whole as a conflict copy.
 
 - **Diff.** Patience diff: lines unique on both sides are matched first. Ties go to the run with the most characters, so headings and paragraphs anchor the alignment ahead of blank lines. Myers fills the gaps. Above an edit distance of 4,000, a gap becomes one coarse hunk, which is still correct but may conflict more.
-- **Clean.** Edits to different lines merge, including adjacent lines. So does an insertion next to the other side's change, and so do identical changes on both sides.
+- **Clean.** Edits to different lines merge, including adjacent lines. So does an insertion next to the other side's change, and so do identical changes on both sides. An insertion that the other side's adjacent replacement already contains at that edge is the same change made twice, and is applied once (a client retrying an edit it has since extended, after the server took the first try).
 - **Conflict.** Different changes to overlapping lines conflict. So do different insertions at the same point, a delete against an edit of the same line, and an unterminated last line that the other side appended after.
 - **Bytes.** `mergeBytes` refuses to merge content that isn't valid UTF-8. It keeps BOMs and CRLF byte for byte.
 - **Symmetric.** `merge(base, a, b)` and `merge(base, b, a)` always agree.
@@ -91,8 +91,10 @@ Fuzzed properties are in `packages/core/test/merge.fuzz.test.ts`, over unique-li
 - **The one safety rule.** The engine overwrites or deletes a local file only when the server already has its content: the version last synced, or content the server just acknowledged. Anything else is a local edit; it is pushed and merged, never overwritten. A remote change it cannot apply yet is kept as pending and retried.
 - **Transfers.** Blobs move 8 at a time. On a pull, the blobs for the next 64 changes are fetched ahead, but only a cache: each note is still checked just before it is replaced. A put the server refuses as `missing blob` (a cache or proxy answered `hasBlob`) is uploaded and sent once more.
 - **Busy notes.** An adapter may refuse to touch one note for now (`LocalBusyError`: the plugin's editor holds typing that would clash). The remote state stays pending, as for unsynced local content, and the pass carries on.
-- **Server rules.** Current base: accepted. Stale base: three-way merge from the base version, or a conflict copy. Content the path already saw after the base is a replay (or a stale copy from a device that lost its state) and changes nothing. A stale delete loses to the newer edit. An edit to a moved note follows it. A move onto a taken path lands on a conflict name. Paths are keyed case-insensitively.
-- **Paths.** Only `.md` notes sync, never hidden paths (a name starting with a dot, which covers `.obsidian/`, `.trash/`, `.git/`; Obsidian never indexes them) and never names some device cannot store (`< > : " | ? *`, a trailing space or dot, `CON`, `NUL` and the like). The server refuses them; clients leave them alone.
+- **Server rules.** Current base: accepted. Stale base: three-way merge from the base version, or a conflict copy. The base is the ancestor only if the note now at the path descends from it: after a delete and a new note, a note created where it moved away, or another note moved in, the merge uses an empty ancestor, so overlapping content becomes a conflict copy instead of being spliced into a stranger. Content the note already saw after the base, at its path or where it moved, is a replay (or a stale copy from a device that lost its state) and changes nothing. A stale delete loses to the newer edit. An edit to a moved note follows it. A move onto a taken path lands on a conflict name. A note and a folder may not share a name. Paths are keyed case-insensitively.
+- **Server identity.** `/v1/state` and `/v1/changes` carry the vault's id, fixed when its data directory is created. Each pull also reads back the change at the client's cursor and compares it with the one the client applied there. A client whose state belongs to another vault, or whose cursor change is gone or different (the server was restored from a backup of its data directory, even if new writes have since passed the cursor), drops its state and resyncs as if it were lost: local files are kept and compared, never trusted as synced. So restoring `/data` from a backup is safe for every device.
+- **Guards.** A pass that finds no notes at all where 10 or more were synced refuses to delete them (an unmounted or emptied folder) and fails until the folder is back. A note over 10 MB is not sent, and a synced note that outgrows the limit is not read as deleted. When a put is accepted while the file changed again during the round trip, the accepted content becomes the base, so the next put does not make the server merge the device's own two saves.
+- **Paths.** Only `.md` notes sync, never hidden paths (a name starting with a dot, which covers `.obsidian/`, `.trash/`, `.git/`; Obsidian never indexes them) and never names some device cannot store (`< > : " | ? *`, a trailing space or dot, `CON`, `NUL`, `COM¹` and the like, or a name over 255 UTF-8 bytes). The server refuses them; clients leave them alone. Conflict copies of long names are shortened to stay valid, and device names are NFC-normalized before they go into one.
 - **Case.** A case-only rename is a move. The engine finds a note's local file with `LocalFs.variants` at the moment it acts, never from an earlier listing, and never renames onto another file. On a case-sensitive disk, two names for one key are separated (the extra becomes a conflict copy, or is dropped if the server already has it).
 
 ## Simulator (`packages/sim`)
@@ -101,7 +103,7 @@ A discrete-event world with virtual time: 3–10 clients on case-sensitive and c
 
 1. **Convergence.** Every client's notes equal the server's, byte for byte and name for name.
 2. **No silent loss.** Every piece of content the engine overwrote or deleted on any device is in the server's files or history.
-3. **No resurrection.** After a delete, no put brings the path back with content it held before, unless a user put it there again.
+3. **No resurrection.** After a delete, or a move away, no put brings the path back with content it held before, unless a user put it there again (or moved it there concurrently with the delete).
 4. **No stale deletes.** Every delete in the log was based on the version it removed.
 5. **Crash safety.** 1–4 hold with the crashes above injected throughout.
 
@@ -110,17 +112,18 @@ Each checker was confirmed to fail when the matching bug is injected (engine ove
 ## Server (`packages/server`)
 
 - **Store.** `SqliteVaultStore` implements the M1 `VaultStore` on `bun:sqlite` (WAL, `synchronous=FULL`). Each op's changes and rows commit in one transaction. Blobs live in `blobs/ab/cd/<sha256>`, written to a temp file, fsynced and renamed before any change names them. A commit checks the log still ends where this process left it, so a second server on the same data directory fails instead of corrupting it. The simulator runs against this store too, reopening the database after every simulated server crash.
-- **API.** The endpoints in the design doc. `/v1/live` takes the token as a bearer header or as the subprotocol `token.<token>` (browsers, so the plugin, cannot set headers), plus the device as `?device=`. It pushes each accepted change and pings every 25 s. Only a SHA-256 of the token is stored; rotation applies at once.
-- **Admin CLI.** `serve`, `rotate-token`, `healthcheck`. History and restore arrive in M4.
+- **One server per data directory.** `serve` takes an exclusive OS-held lock on `server.lock` before cleaning temp files, so a second server on the same directory refuses to start. Files are created owner-only (umask 077). `rotate-token` refuses a directory with no vault unless given `--init` (a mistyped `--data` would otherwise create an empty vault the running server never sees).
+- **API.** The endpoints in the design doc. `/v1/live` takes the token as a bearer header or as the subprotocol `token.<token>` (browsers, so the plugin, cannot set headers), plus the device as `?device=`; a client using the subprotocol must also offer `bettersync`, so the token is never echoed back in the handshake. It pushes each accepted change and pings every 25 s. JSON responses are `no-store`. Only a SHA-256 of the token is stored; rotation applies at once.
+- **Admin CLI.** `serve`, `rotate-token [--init]`, `healthcheck`. History and restore arrive in M4.
 
 ## Headless client (`packages/headless`)
 
-- **DiskFs.** The engine's `LocalFs` on a real folder. Paths resolve folder by folder, so NFD names (copied from a Mac onto Linux) and other-case names on case-insensitive disks map to the actual file. Writes are temp file, fsync, rename. Symlinks are not followed. Folders the engine emptied are removed.
-- **Concurrent edits.** M1's check-then-write window is closed here. DiskFs remembers each file's inode, size, mtime and ctime at the engine's last read. It refuses to overwrite, delete or rename a file that changed since, and to write where a file appeared or vanished. The pass stops with `ConcurrentChangeError` and the next one picks the edit up. What remains is the few system calls between that check and the rename.
+- **DiskFs.** The engine's `LocalFs` on a real folder. Paths resolve folder by folder, so NFD names (copied from a Mac onto Linux) and other-case names on case-insensitive disks map to the actual file. Writes are temp file, fsync, rename. Symlinks inside the folder are not followed, neither when listing nor when writing: a note that would land in a symlinked folder is busy and stays on the server. A missing folder is an error, never an empty vault. Folders the engine emptied are removed.
+- **Concurrent edits.** M1's check-then-write window is closed here. DiskFs remembers each file's inode, size, mtime and ctime at the engine's last read. It refuses to overwrite, delete or rename a file that changed since, and to write where a file appeared or vanished. A new note is published with `link()`, which fails if a file appeared meanwhile. The pass stops with `ConcurrentChangeError` and the next one picks the edit up. What remains, for an existing note, is the few system calls between that check and the rename.
 - **Racy stats.** The engine skips rehashing a file whose mtime and size match what it recorded. Timestamps are coarse (on ext4, half of 50 rapid writes repeated an earlier mtime and size), so a same-size edit saved just after the engine's own write could go unseen forever. As in git, a stat recorded within 2 s of the file's mtime is marked racy and never trusted. The sim missed this because its mtimes are a counter.
 - **Folder case.** On a case-insensitive disk, notes in `Projects/` and `projects/` share one folder, so the engine compares folder names ignoring case and file names exactly (`sameNoteName`). Otherwise two devices would move notes back and forth forever.
 - **Speed.** Lookups use synchronous `lstat`/`readdir` (Bun's async fs costs several times more per call), with a fast path on case-sensitive disks. At 3,000 notes an idle pass takes about 75 ms, and a first sync of a full folder about 4 s in process. Over HTTP on localhost, uploading 3,000 notes takes about 30 s and downloading them about 22 s, one request per note: fine as a one-time cost, and a candidate for batching later.
-- **Runner.** Core's `Runner`, shared with the plugin. A pass runs 1 s after local writes stop (at most 5 s into a burst), at once when `/v1/live` announces a change or reconnects, every 60 s regardless, and after failures with backoff from 1 s to 60 s. The headless client feeds it native file watching.
+- **Runner.** Core's `Runner`, shared with the plugin. A pass runs 1 s after local writes stop (at most 5 s into a burst), at once when `/v1/live` announces a change or reconnects, every 60 s regardless, and after failures with backoff from 1 s to 60 s. While offline or with a rejected token, local changes wait out the backoff too; a live message, a reconnect, waking and "sync now" cut it short. The headless client feeds it native file watching.
 
 ## Kill tests (`packages/headless/test/kill.test.ts`)
 
@@ -137,7 +140,8 @@ Settings: server URL, token, device name (pre-filled from the host name, or `iph
 - **Pushing typing.** Every editor change counts as a local change. Before each pass the plugin saves editors holding typing (except busy ones), so typing reaches other devices about 1 s after it stops rather than after Obsidian's 2 s autosave.
 - **Case-only renames on case-folding disks.** On ext4 with casefold (Android's shared storage), renaming `Note.md` to `note.md` is a no-op on disk while Obsidian's index takes the new name. The plugin checks the name on disk after a case-only rename and, if it did not change, renames through a temporary name.
 - **Transport.** Obsidian's `requestUrl` (no CORS, same on desktop and iOS); `/v1/live` over the browser WebSocket with the token as a subprotocol. The server marks blobs `no-store`: Chromium answered a HEAD for a blob from a cached GET of the same URL, so a fresh server at the same address was never sent it.
-- **State.** `state.json` in the plugin folder; settings in `data.json`. A new server URL starts the state fresh.
+- **State.** `state.json` in the plugin folder; settings in `data.json`. A new server URL starts the state fresh. Starts and stops run one after another, so a runner is fully stopped before the next opens the state.
+- **Fail safe.** The editor guard reads Obsidian's `dirty` and `lastSavedData`, which are not public API. If a version lacks them, an open note counts as holding typing and is never written while open. A note created by the engine is checked on disk first, since the vault index can lag a file another app just wrote.
 
 Measured on the Linux test VM (Obsidian 1.13.7, server on the host):
 
@@ -182,4 +186,9 @@ Plugins cannot run in the background on iOS, so the plugin syncs while Obsidian 
 - A program or another plugin writing a note in the few milliseconds between the plugin's last check and its own write to that note (a vault write takes a few awaits) can still be overwritten, like the few system calls DiskFs leaves. The same goes for typing that starts in the moment a remote delete removes the open note. Typing merged into an open editor is not exposed: from the check to the merge nothing awaits.
 - Android is not a release gate. Its shared storage folds case like the casefold disk tested here, but it has not run on Android.
 - Obsidian and the headless client on the same folder at once are not prevented (the headless lock is not checked by the plugin); each would take the other's writes for user edits, which is safe but wasteful.
+- Editors that are not workspace leaves (a note edited in a Canvas card or a hover popover) are not seen by the editor guard, so typing there that overlaps a remote change can be dropped by Obsidian's own reload.
+- If Obsidian dies between the two renames of a case-only rename on a case-folding disk, the temporary name (`Note.bettersync-<ts>.md`) syncs as a rename.
+- Case keys use `toLowerCase`, which is not full case folding: names that differ only as `ς`/`σ`, `ſ`/`s` or `µ`/`μ` get different keys although APFS and NTFS treat them as one. Changing the key needs a migration of the server's rows and the clients' state.
+- On a case-sensitive disk, an NFC and an NFD file of the same name map to one path; the second is not synced.
+- A device offline for a long time replays every intermediate version of every note, not just the last.
 

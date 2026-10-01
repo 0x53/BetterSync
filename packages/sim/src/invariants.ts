@@ -72,7 +72,9 @@ export function checkObserved(o: Observed): string[] {
   // 3 + 4, from the change log. History per key is every content it held or was sent.
   const version = new Map<string, number>();
   const history = new Map<string, Set<string>>();
-  const deletedWith = new Map<string, { time: number; hashes: Set<string> }>();
+  /** Per key emptied by a delete or by a move away: when, what it had held, and when the version that op was based on was written. */
+  const deletedWith = new Map<string, { time: number; since: number; hashes: Set<string> }>();
+  const timeAt = new Map<number, number>();
   const remember = (key: string, h: string | null | undefined) => {
     if (!h) return;
     let s = history.get(key);
@@ -84,23 +86,31 @@ export function checkObserved(o: Observed): string[] {
     if (c.op === "delete") {
       // 4. No stale deletes: a delete applies only on top of the version it was based on.
       if (version.get(key) !== c.baseVersion) out.push(`stale delete: seq ${c.seq} deleted ${c.path} based on ${c.baseVersion}, current was ${version.get(key)}`);
-      deletedWith.set(key, { time: c.time, hashes: new Set(history.get(key)) });
+      deletedWith.set(key, { time: c.time, since: timeAt.get(c.baseVersion ?? 0) ?? 0, hashes: new Set(history.get(key)) });
     } else if (c.op === "put") {
       // 3. No resurrection: after a delete, a put never brings the key back with content it held
       // before. (A move carries its source note, whatever that holds, so it cannot resurrect.)
-      // Exempt: a user put that content there again after the delete, or a user moved it onto
-      // another path (acting on the note, so it survives, like an edit) and the server followed
-      // a concurrent move of that path back here.
+      // A move away empties its source key the same way: the note went elsewhere, and a put that
+      // brings its old content back to the old name is the renamed-note-reappears bug.
+      // Exempt: a user put that content there, or moved it onto another path (acting on the note,
+      // so it survives, like an edit) from where the server followed it back here, concurrently
+      // with the delete or after it: after the version the delete was based on. That is an edit,
+      // and an edit beats a concurrent delete.
       const gone = deletedWith.get(key);
       for (const h of [c.hash, c.submitted]) {
         if (!h || !gone?.hashes.has(h)) continue;
-        if (o.placed.some((p) => p.hash === h && (p.key === key ? p.time >= gone.time : p.moved))) continue;
+        if (o.placed.some((p) => p.hash === h && (p.key === key || p.moved) && p.time >= gone.since)) continue;
         out.push(`resurrection: seq ${c.seq} brought back ${c.path} (${h.slice(0, 8)}) after it was deleted`);
       }
+    }
+    if (c.op === "move" && c.from !== undefined && pathKey(c.from) !== key) {
+      const from = pathKey(c.from);
+      deletedWith.set(from, { time: c.time, since: timeAt.get(version.get(from) ?? 0) ?? 0, hashes: new Set(history.get(from)) });
     }
     remember(key, c.hash);
     remember(key, c.submitted);
     version.set(key, c.seq);
+    timeAt.set(c.seq, c.time);
     if (c.op === "move" && c.from !== undefined) version.set(pathKey(c.from), c.seq);
   }
 

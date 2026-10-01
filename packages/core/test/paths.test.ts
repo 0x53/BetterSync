@@ -18,6 +18,17 @@ describe("path rules", () => {
     }
   });
 
+  test("rejects reserved names Windows also matches (superscript digits, spaces before the dot)", () => {
+    for (const p of ["COM¹.md", "LPT².md", "con .md", "Folder/aux  .md"]) expect([p, isSyncablePath(p)]).toEqual([p, false]);
+    expect(isSyncablePath("console.md")).toBe(true);
+  });
+
+  test("rejects names longer than 255 UTF-8 bytes", () => {
+    expect(isSyncablePath(`${"a".repeat(252)}.md`)).toBe(true);
+    expect(isSyncablePath(`${"a".repeat(253)}.md`)).toBe(false);
+    expect(isSyncablePath(`${"界".repeat(90)}.md`)).toBe(false);
+  });
+
   test("rejects malformed paths", () => {
     for (const p of ["", "a.txt", "a/../b.md", "/a.md", "a//b.md", "a\\b.md", "tab\t.md", "Note.MD", "é.md"]) expect(isSyncablePath(p)).toBe(false);
   });

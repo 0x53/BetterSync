@@ -29,6 +29,8 @@ export interface PathState {
 
 /** GET /v1/state */
 export interface StateResponse {
+  /** This vault's identity, fixed when its data directory is created. A client that sees another one starts over. */
+  vault?: string;
   seq: Seq;
   files: FileEntry[];
 }
@@ -55,6 +57,7 @@ export interface Change {
 
 /** GET /v1/changes */
 export interface ChangesResponse {
+  vault?: string;
   changes: Change[];
   /** Highest seq on the server; equal to the last change's seq when complete. */
   seq: Seq;

@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { isSha256Hex, pathKey, type BlobHash, type Change, type ChangeOp, type FileRow, type Seq, type VaultStore } from "@bettersync/core";
 
 /**
@@ -69,18 +69,21 @@ interface ChangeRecord {
 }
 
 const TMP_SUFFIX = ".tmp";
+export const DB_FILE = "bettersync.db";
+const VAULT_META = "vault_id";
 
 export class SqliteVaultStore implements VaultStore {
   readonly db: Database;
   private readonly blobDir: string;
   private lastSeq: Seq;
+  private readonly id: string;
   private readonly q;
 
   constructor(readonly dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
     this.blobDir = join(dataDir, "blobs");
     mkdirSync(this.blobDir, { recursive: true });
-    this.db = new Database(join(dataDir, "bettersync.db"), { create: true, strict: true });
+    this.db = new Database(join(dataDir, DB_FILE), { create: true, strict: true });
     this.db.run("PRAGMA journal_mode = WAL");
     // FULL: a commit acknowledged to a client survives power loss, not just a killed process.
     this.db.run("PRAGMA synchronous = FULL");
@@ -92,6 +95,8 @@ export class SqliteVaultStore implements VaultStore {
       live: this.db.query<FileRecord, []>("SELECT path, hash, size, mtime, version, moved_to FROM files WHERE hash IS NOT NULL"),
       change: this.db.query<ChangeRecord, [number]>("SELECT * FROM changes WHERE seq = ?"),
       after: this.db.query<ChangeRecord, [number, number]>("SELECT * FROM changes WHERE seq > ? ORDER BY seq LIMIT ?"),
+      on: this.db.query<ChangeRecord, [string, number]>("SELECT * FROM changes WHERE key = ? AND seq > ? ORDER BY seq"),
+      under: this.db.query<{ x: number }, [string, string]>("SELECT 1 AS x FROM files WHERE key >= ? AND key < ? AND hash IS NOT NULL LIMIT 1"),
       seen: this.db.query<{ x: number }, { key: string; after: number; hash: string }>(
         `SELECT 1 AS x FROM changes WHERE key = $key AND seq > $after AND (hash = $hash OR submitted = $hash)
          UNION ALL
@@ -111,6 +116,7 @@ export class SqliteVaultStore implements VaultStore {
       setMeta: this.db.query("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v"),
     };
     this.lastSeq = this.q.seq.get()?.seq ?? 0;
+    this.id = this.getMeta(VAULT_META) ?? (this.setMeta(VAULT_META, crypto.randomUUID()), this.getMeta(VAULT_META)!);
   }
 
   private migrate(): void {
@@ -124,10 +130,36 @@ export class SqliteVaultStore implements VaultStore {
   }
 
   close(): void {
+    this.lock?.close();
     this.db.close();
   }
 
+  private lock: Database | undefined;
+
+  /**
+   * Takes the data directory for this process alone, until close or exit: an
+   * exclusive SQLite lock on `server.lock`, which the OS drops when the
+   * process dies. False if another process holds it.
+   */
+  lockExclusive(): boolean {
+    const db = new Database(join(this.dataDir, "server.lock"), { create: true });
+    try {
+      db.run("PRAGMA locking_mode = EXCLUSIVE");
+      db.run("BEGIN EXCLUSIVE");
+    } catch (e) {
+      db.close();
+      if ((e as { code?: string }).code?.startsWith("SQLITE_BUSY")) return false;
+      throw e;
+    }
+    this.lock = db;
+    return true;
+  }
+
   // ---- VaultStore ----
+
+  vaultId(): string {
+    return this.id;
+  }
 
   seq(): Seq {
     return this.lastSeq;
@@ -154,6 +186,15 @@ export class SqliteVaultStore implements VaultStore {
     return this.q.after.all(after, limit).map(toChange);
   }
 
+  changesOn(key: string, after: Seq): Change[] {
+    return this.q.on.all(key, after).map(toChange);
+  }
+
+  hasLiveUnder(prefix: string): boolean {
+    // Keys under "a/" sort from "a/" up to "a0" ("0" follows "/").
+    return this.q.under.get(prefix, `${prefix.slice(0, -1)}0`) !== null;
+  }
+
   seenAfter(key: string, after: Seq, hash: BlobHash): boolean {
     return this.q.seen.get({ key, after, hash }) !== null;
   }
@@ -175,7 +216,12 @@ export class SqliteVaultStore implements VaultStore {
   putBlob(hash: BlobHash, bytes: Uint8Array): void {
     const path = this.blobPath(hash);
     const dir = path.slice(0, path.lastIndexOf("/"));
-    mkdirSync(dir, { recursive: true });
+    if (!existsSync(dir)) {
+      // New fan-out folders must be durable entries in their parents too, or a power cut can lose a committed blob.
+      mkdirSync(dir, { recursive: true });
+      fsyncDir(dirname(dir));
+      fsyncDir(dirname(dirname(dir)));
+    }
     const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}${TMP_SUFFIX}`;
     const fd = openSync(tmp, "wx");
     try {

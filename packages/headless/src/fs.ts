@@ -1,7 +1,7 @@
 import { closeSync, fsyncSync, lstatSync, openSync, readdirSync, type Stats } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { ConcurrentChangeError, pathKey, type LocalFs, type LocalStat } from "@bettersync/core";
+import { ConcurrentChangeError, LocalBusyError, pathKey, type LocalFs, type LocalStat } from "@bettersync/core";
 
 /**
  * A plain folder as the engine's LocalFs.
@@ -23,8 +23,13 @@ import { ConcurrentChangeError, pathKey, type LocalFs, type LocalStat } from "@b
  * engine's last look, and refuses to overwrite, delete or rename a file that
  * changed since, or to write over a path that was empty when the engine
  * looked. The engine's pass then fails with ConcurrentChangeError and the
- * next pass sees the edit. What remains is the moment between that check and
- * the rename, a few system calls wide.
+ * next pass sees the edit. A new note is published with link(), which fails
+ * if a file appeared meanwhile. What remains, for an existing note, is the
+ * moment between that check and the rename, a few system calls wide.
+ *
+ * Symlinks. A symlinked folder is not part of the vault: list() does not
+ * follow it, lookups do not resolve through it, and a note that would land
+ * inside one is busy (LocalBusyError) rather than written outside the folder.
  */
 export class DiskFs implements LocalFs {
   /** Identity of each file as of the engine's last look, by path on disk; null = it was not there. */
@@ -35,6 +40,9 @@ export class DiskFs implements LocalFs {
 
   async list(): Promise<LocalStat[]> {
     const out: LocalStat[] = [];
+    // A missing folder (moved away, unmounted) is an error, never an empty vault whose notes were all deleted.
+    // The folder itself may be a symlink; only links inside it are not followed.
+    if (!(await fsp.stat(this.root).catch(() => null))?.isDirectory()) throw new Error(`${this.root} is missing or not a folder`);
     const walk = async (dir: string) => {
       for (const e of await readdirSafe(join(this.root, dir))) {
         const rel = dir === "" ? e.name : `${dir}/${e.name}`;
@@ -96,7 +104,7 @@ export class DiskFs implements LocalFs {
     // Over an existing file, keep its actual name (folder case included), like a save in an editor does.
     const disk = existing ?? path;
     const abs = join(this.root, disk);
-    await fsp.mkdir(dirname(abs), { recursive: true });
+    await this.ensureDir(dirname(disk), path);
     const mode = existing ? (await lstatSafe(abs))?.mode : undefined;
     const tmp = join(dirname(abs), tempName());
     const fh = await fsp.open(tmp, "wx", mode === undefined ? 0o644 : mode & 0o7777);
@@ -108,10 +116,10 @@ export class DiskFs implements LocalFs {
     }
     try {
       await this.checkUnchanged(existing, path);
-      await fsp.rename(tmp, abs);
-    } catch (e) {
+      if (existing === null) await publishNew(tmp, abs, path);
+      else await fsp.rename(tmp, abs);
+    } finally {
       await fsp.rm(tmp, { force: true });
-      throw e;
     }
     fsyncDir(dirname(abs));
     const st = await lstatSafe(abs);
@@ -141,7 +149,8 @@ export class DiskFs implements LocalFs {
     const dst = await this.resolve(to);
     if (dst !== null && dst !== src) throw new ConcurrentChangeError(to, "is another file");
     const abs = join(this.root, to);
-    await fsp.mkdir(dirname(abs), { recursive: true });
+    await this.ensureDir(dirname(to), to);
+    if (dst === null && (await lstatSafe(abs))) throw new ConcurrentChangeError(to, "appeared since it was looked up");
     await fsp.rename(join(this.root, src), abs);
     fsyncDir(dirname(abs));
     const moved = (await this.resolve(to)) ?? to;
@@ -179,7 +188,7 @@ export class DiskFs implements LocalFs {
     // Fast path: on a case-sensitive disk, a path that exists is its own actual name.
     if (await this.caseSensitive()) {
       const st = await lstatSafe(join(this.root, path));
-      if (st?.isFile()) return path;
+      if (st?.isFile()) return (await this.folderState(dirname(path))) === "ok" ? path : null;
     }
     const found = await this.diskVariants(path);
     const exact = found.find((d) => nfc(d) === path);
@@ -238,6 +247,40 @@ export class DiskFs implements LocalFs {
     return this.sensitive;
   }
 
+  /** Whether every folder on the way to `dir` is a real folder ("ok"), one is missing, or one is a symlink or a file. */
+  private async folderState(dir: string): Promise<"ok" | "missing" | "blocked"> {
+    let rel = "";
+    for (const seg of dir === "." || dir === "" ? [] : dir.split("/")) {
+      rel = rel === "" ? seg : `${rel}/${seg}`;
+      const st = await lstatSafe(join(this.root, rel));
+      if (!st) return "missing";
+      if (!st.isDirectory()) return "blocked";
+    }
+    return "ok";
+  }
+
+  /**
+   * Creates the folders on the way to `dir` one at a time, never through a
+   * symlink (mkdir and rename follow one anywhere but the last name).
+   */
+  private async ensureDir(dir: string, path: string): Promise<void> {
+    let rel = "";
+    for (const seg of dir === "." || dir === "" ? [] : dir.split("/")) {
+      rel = rel === "" ? seg : `${rel}/${seg}`;
+      const abs = join(this.root, rel);
+      let st = await lstatSafe(abs);
+      if (!st) {
+        try {
+          await fsp.mkdir(abs);
+        } catch (e) {
+          if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+        }
+        st = await lstatSafe(abs);
+      }
+      if (!st?.isDirectory()) throw new LocalBusyError(path, `cannot be stored: ${rel} is a symlink or a file`);
+    }
+  }
+
   private async checkUnchanged(disk: string | null, path: string): Promise<void> {
     if (disk === null) {
       if (this.seen.get(path)) throw new ConcurrentChangeError(path, "was deleted since it was read");
@@ -259,6 +302,25 @@ export class DiskFs implements LocalFs {
       dir = dirname(dir);
     }
   }
+}
+
+/**
+ * Moves a finished temp file to a path that was empty, failing if a file
+ * appeared there meanwhile (rename would replace it). link() is atomic and
+ * refuses an existing name, other-case names included on a case-insensitive
+ * disk. Where links are unsupported, a last look before the rename.
+ */
+async function publishNew(tmp: string, abs: string, path: string): Promise<void> {
+  try {
+    await fsp.link(tmp, abs);
+    return;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "EEXIST") throw new ConcurrentChangeError(path, "appeared while being written");
+    if (code !== "EPERM" && code !== "ENOTSUP" && code !== "EOPNOTSUPP" && code !== "ENOSYS" && code !== "EXDEV") throw e;
+  }
+  if (await lstatSafe(abs)) throw new ConcurrentChangeError(path, "appeared while being written");
+  await fsp.rename(tmp, abs);
 }
 
 const TEMP = /^\.bettersync-[0-9a-z]+\.tmp$/;

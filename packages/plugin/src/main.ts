@@ -45,6 +45,9 @@ export default class BetterSyncPlugin extends Plugin {
   private status: Status = "setup";
   private restartTimer: number | undefined;
   private generation = 0;
+  /** Starts and stops run one after another, so a runner is fully stopped before the next one opens the state. */
+  private lifecycle: Promise<void> = Promise.resolve();
+  private unloaded = false;
   private readonly logLines: string[] = [];
 
   override async onload(): Promise<void> {
@@ -64,7 +67,12 @@ export default class BetterSyncPlugin extends Plugin {
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => this.runner?.syncNow() });
     this.addCommand({ id: "toggle-pause", name: "Pause or resume syncing", callback: () => void this.setPaused(!this.settings.paused) });
     this.addCommand({ id: "show-status", name: "Show sync status", callback: () => new Notice(STATUS[this.effectiveStatus()].label) });
-    this.addCommand({ id: "copy-log", name: "Copy recent sync log", callback: () => void navigator.clipboard.writeText(this.logLines.join("\n")).then(() => new Notice("BetterSync: log copied")) });
+    this.addCommand({ id: "copy-log", name: "Copy recent sync log", callback: () =>
+        void navigator.clipboard.writeText(this.logLines.join("\n")).then(
+          () => new Notice("BetterSync: log copied"),
+          (e: unknown) => new Notice(`BetterSync: could not copy the log (${e instanceof Error ? e.message : String(e)})`),
+        ),
+    });
 
     for (const kind of ["create", "modify", "delete", "rename"] as const) {
       this.registerEvent(this.app.vault.on(kind as "rename", (file: TAbstractFile, oldPath?: string) => this.onVaultEvent(kind, file, oldPath)));
@@ -80,9 +88,15 @@ export default class BetterSyncPlugin extends Plugin {
 
   override onunload(): void {
     window.clearTimeout(this.restartTimer);
-    // A start() still awaiting sees this and never creates its runner.
+    // A start() still awaiting sees this and never creates its runner; a queued one never runs.
+    this.unloaded = true;
     this.generation++;
-    void this.stopRunner();
+    void this.queue(() => this.stopRunner());
+  }
+
+  private queue(step: () => Promise<void>): Promise<void> {
+    this.lifecycle = this.lifecycle.then(step, step);
+    return this.lifecycle;
   }
 
   /** The API the tests and a debugging user can reach: app.plugins.plugins.bettersync. */
@@ -92,7 +106,12 @@ export default class BetterSyncPlugin extends Plugin {
 
   // ---- lifecycle ----
 
-  private async start(): Promise<void> {
+  private start(): Promise<void> {
+    return this.queue(() => this.restart());
+  }
+
+  private async restart(): Promise<void> {
+    if (this.unloaded) return;
     const gen = ++this.generation;
     await this.stopRunner();
     const { server, token, device } = this.settings;
@@ -156,14 +175,18 @@ export default class BetterSyncPlugin extends Plugin {
     this.app.workspace.iterateAllLeaves((leaf) => {
       const view = leaf.view;
       if (view instanceof MarkdownView && view.file?.path === path) {
+        // dirty and lastSavedData are not public API. If they go away, fail safe: an editor whose
+        // saved text is unknown counts as holding typing, and its note is not written while open.
         const v = view as MarkdownView & { dirty?: boolean; lastSavedData?: string };
+        const savedText = () => (typeof v.lastSavedData === "string" ? v.lastSavedData : null);
         out.push({
           get dirty() {
-            return v.dirty === true;
+            const saved = savedText();
+            return v.dirty === true || saved === null || saved !== v.getViewData();
           },
           save: () => v.save(),
           text: () => v.getViewData(),
-          savedText: () => v.lastSavedData ?? v.data,
+          savedText,
           setText: (text) => replaceText(v.editor, text),
         });
       }
@@ -181,7 +204,12 @@ export default class BetterSyncPlugin extends Plugin {
     const saves: Promise<void>[] = [];
     this.app.workspace.iterateAllLeaves((leaf) => {
       const view = leaf.view;
-      if (!(view instanceof MarkdownView) || (view as unknown as { dirty?: boolean }).dirty !== true) return;
+      if (!(view instanceof MarkdownView)) return;
+      if ((view as unknown as { dirty?: boolean }).dirty !== true) {
+        // Saved: whatever waited on this editor's typing waits no longer.
+        if (view.file) this.fs?.clearBusy(view.file.path);
+        return;
+      }
       if (view.file && this.fs?.isBusy(view.file.path)) return;
       saves.push(view.save().catch(() => {}));
     });
