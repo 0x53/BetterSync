@@ -2,7 +2,7 @@
 
 Syncs one person's Obsidian vault across their devices and agents through a small self-hosted server. The design doc is the source of truth for scope and decisions.
 
-Status: **M3 built**. The Obsidian plugin runs the shared engine on the vault. It passes the simulator with its adapter, end-to-end tests in a real Obsidian (on case-sensitive and case-insensitive disks), and kill tests in which Obsidian itself is SIGKILLed at random alongside the headless clients and the server. The M3 gate is daily use on all your devices, with LiveSync retired; iOS is checked by hand (see [Plugin on iOS](#plugin-on-ios)).
+Status: **M3 built**. The Obsidian plugin runs the shared engine on the vault. It passes the simulator with its adapter, end-to-end tests in a real Obsidian (on case-sensitive and case-insensitive disks), and kill tests in which Obsidian itself is SIGKILLed at random alongside the headless clients and the server. The M3 gate is daily use on all your devices, with LiveSync retired; iOS is checked by hand (see [Plugin on iOS](#plugin-on-ios)). That trial is under way on Windows and iPhone (since 2026-10-01); issues found so far are collected in [FIXES.md](FIXES.md) and fixed in a batch afterwards.
 
 ## Layout
 
