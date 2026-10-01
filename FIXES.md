@@ -117,6 +117,41 @@ for example "3 conflict copies of BetterSync test.md".
   including the newest. Until M4's history/restore exists, document how to get a deleted
   version back from the change log and the blob store.
 
+## 5. Joining a device that holds a stale replica makes conflict copies
+
+**Severity:** medium. It happens once per device at migration, but it is the first thing a
+new user sees. No data was lost.
+
+**What happened (2026-10-01 22:25):** the iPhone joined with the vault LiveSync had left
+on it. iOS LiveSync only syncs in the foreground, so the phone was days behind CouchDB
+on 4 notes. Its first pass pushed all 4 with no base, and the server kept each as
+`(conflict … iphone)` (changes 284–287). Every copy was an **older** version:
+
+- `plans/2026-09-28`: the phone had the 09-27 version, and the server had the 09-29 update.
+- `food/Shopping List`: the 09-27 list, superseded on 09-29.
+- `travel/VW …`: the version from before the flights were booked.
+- `travel/In-Laws …`: the agent's 09-26 08:43 text, which the laptop edited at 22:27 that day.
+
+CouchDB held the newer text for all 4, so the phone had not pulled it. This was not a
+server-side LiveSync drop.
+
+**Why it can't fast-forward:** a device with no state has no base, and the server's replay
+detection only knows versions it has seen. History starts at the server's initial upload,
+so pre-migration versions are unknown. Choosing the newer side would mean trusting mtimes,
+which the design rightly does not. The conflict copy is the correct safe outcome.
+
+**Fixes:**
+
+- **Docs (cheapest):** under migration, say "join each existing device from an **empty**
+  vault (or a fresh copy), not from the old sync's replica". Alternatively, fully sync the
+  old system on that device right before switching.
+- **Plugin: offer "This device's copy may be out of date" on first connect.** Choosing
+  it takes the server version for differing notes. The local versions are pushed as
+  **history-only** entries rather than visible conflict copies, so nothing is lost and the
+  vault stays clean. This needs M4's history; until then, conflict copies are the safe default.
+- **Migration import:** optionally seed the server's history with known prior versions
+  (git history, or the old sync's replica) so replay detection recognises them.
+
 ## Not a bug, but trial feedback
 
 - Only `.md` syncs. The trial vault has 9 non-note files (images, a `.base`, an `.html`).
