@@ -26,7 +26,12 @@ export interface LocalStat {
   size: number;
 }
 
-/** A vault folder. Writes are atomic (temp file + rename) and create parent folders. */
+/**
+ * A vault folder. Writes are atomic (temp file + rename) and create parent
+ * folders. An adapter that can tell a file changed since the engine last
+ * looked at it (a user's edit racing the engine's write) throws
+ * ConcurrentChangeError instead of replacing it; the next pass sees the edit.
+ */
 export interface LocalFs {
   /** Every file in the folder, syncable or not. */
   list(): Promise<LocalStat[]>;
@@ -43,6 +48,24 @@ export interface LocalFs {
   remove(path: string): Promise<void>;
   rename(from: string, to: string): Promise<void>;
 }
+
+/** The file changed under the engine; the pass stops and the next one sees the change. */
+export class ConcurrentChangeError extends Error {
+  constructor(
+    readonly path: string,
+    what: string,
+  ) {
+    super(`${path} ${what}`);
+  }
+}
+
+/**
+ * The adapter cannot change this one file yet: an editor holds typing that
+ * the change would clash with (the plugin). The engine keeps the server's
+ * state pending, as it does for unsynced local content, and carries on with
+ * the rest of the pass. Uncaught, it is a ConcurrentChangeError: retry soon.
+ */
+export class LocalBusyError extends ConcurrentChangeError {}
 
 /** The server API (design doc, "API"). Methods reject on network or server errors. */
 export interface Remote {
@@ -113,6 +136,10 @@ export interface PassReport {
 }
 
 const OPS_BATCH = 100;
+/** Blob transfers in flight at once. One at a time, a first sync is bound by round trips (and on iOS by cellular latency). */
+const TRANSFERS = 8;
+/** Remote states whose blobs are fetched ahead of applying them, which bounds the memory the prefetch holds. */
+const PREFETCH_WINDOW = 64;
 /** Filesystem timestamps are coarse (ext4: a few ms; FAT: 2 s), so a stat this recent may hide an edit. */
 const RACY_MS = 2000;
 
@@ -131,6 +158,8 @@ export class SyncEngine {
   /** Local names per key from the last listing; a case-sensitive disk may hold several. */
   private names = new Map<string, string[]>();
   private readonly hash: (bytes: Uint8Array) => Promise<BlobHash>;
+  /** Blobs fetched ahead for the states being applied. Only a cache: each apply still checks the local file first. */
+  private prefetched = new Map<BlobHash, Uint8Array>();
 
   private constructor(
     private readonly deps: EngineDeps,
@@ -169,21 +198,49 @@ export class SyncEngine {
       // They supersede anything pending, including keys they no longer list.
       const st = await this.deps.remote.state();
       this.state.pending = {};
-      for (const f of st.files) await this.applyRemote({ path: f.path, version: f.version, hash: f.hash }, report);
+      const states: PathState[] = st.files.map((f) => ({ path: f.path, version: f.version, hash: f.hash }));
+      await this.applyAll(states, (s) => s, (s) => this.applyRemote(s, report));
       this.state.cursor = st.seq;
     } else {
       for (;;) {
         const page = await this.deps.remote.changes(this.state.cursor);
-        for (const c of page.changes) {
+        await this.applyAll(page.changes, (c) => ({ path: c.path, version: c.seq, hash: c.hash }), async (c) => {
           await this.applyChange(c, report);
           this.state.cursor = c.seq;
-        }
+        });
         await this.save();
         if (page.changes.length === 0 || this.state.cursor >= page.seq) break;
       }
     }
     for (const s of Object.values(this.state.pending)) await this.applyRemote(s, report);
     await this.save();
+  }
+
+  /**
+   * Applies states in order, a window at a time, fetching the blobs each
+   * window needs concurrently first. A blob is fetched only if the local file
+   * does not already hold that content, as tryApply would decide.
+   */
+  private async applyAll<T>(items: readonly T[], state: (item: T) => PathState, apply: (item: T) => Promise<void>): Promise<void> {
+    for (let i = 0; i < items.length; i += PREFETCH_WINDOW) {
+      const window = items.slice(i, i + PREFETCH_WINDOW);
+      const wanted = new Set<BlobHash>();
+      for (const s of window.map(state)) {
+        if (s.hash === null || this.prefetched.has(s.hash) || !this.isNewer(pathKey(s.path), s.version)) continue;
+        const base = this.state.files[pathKey(s.path)];
+        const local = await this.findLocal(pathKey(s.path), base ? [s.path, base.path] : [s.path]);
+        if (!local || (await this.readHash(local.path)) !== s.hash) wanted.add(s.hash);
+      }
+      this.prefetched = new Map();
+      await mapLimit([...wanted], TRANSFERS, async (h) => {
+        this.prefetched.set(h, await this.deps.remote.getBlob(h));
+      });
+      try {
+        for (const s of window) await apply(s);
+      } finally {
+        this.prefetched = new Map();
+      }
+    }
   }
 
   private async applyChange(c: Change, report: PassReport): Promise<void> {
@@ -217,7 +274,15 @@ export class SyncEngine {
   private async applyRemote(s: PathState, report: PassReport): Promise<void> {
     const key = pathKey(s.path);
     const pending = this.state.pending[key];
-    if (await this.tryApply(s, report)) {
+    let applied: boolean;
+    try {
+      applied = await this.tryApply(s, report);
+    } catch (e) {
+      if (!(e instanceof LocalBusyError)) throw e;
+      this.deps.log?.(`waiting: ${e.message}`);
+      applied = false;
+    }
+    if (applied) {
       if (pending && pending.version <= s.version) delete this.state.pending[key];
     } else if (!pending || pending.version < s.version) {
       this.state.pending[key] = s;
@@ -400,10 +465,13 @@ export class SyncEngine {
     }
   }
 
-  private async push(planned: Planned[], report: PassReport): Promise<void> {
-    for (const p of planned) {
-      if (p.op.op === "put" && !(await this.deps.remote.hasBlob(p.op.hash))) await this.deps.remote.putBlob(p.op.hash, p.bytes!);
-    }
+  private async push(planned: Planned[], report: PassReport, retrying = false): Promise<void> {
+    const puts = new Map<BlobHash, Uint8Array>();
+    for (const p of planned) if (p.op.op === "put") puts.set(p.op.hash, p.bytes!);
+    await mapLimit([...puts], TRANSFERS, async ([hash, bytes]) => {
+      if (retrying || !(await this.deps.remote.hasBlob(hash))) await this.deps.remote.putBlob(hash, bytes);
+    });
+    const retry: Planned[] = [];
     for (let i = 0; i < planned.length; i += OPS_BATCH) {
       const batch = planned.slice(i, i + OPS_BATCH);
       const res = await this.deps.remote.ops(batch.map((p) => p.op));
@@ -412,7 +480,9 @@ export class SyncEngine {
         const p = batch[j]!;
         this.deps.log?.(`${JSON.stringify(p.op)} -> ${JSON.stringify(r)}`);
         if (r.status === "rejected") {
-          report.rejected.push({ op: p.op, reason: r.reason });
+          // hasBlob said yes but the server lacks it (a cache or proxy answered): upload regardless, once.
+          if (r.reason === "missing blob" && p.op.op === "put" && !retrying) retry.push(p);
+          else report.rejected.push({ op: p.op, reason: r.reason });
           continue;
         }
         const kept = p.op.op === "put" || (p.op.op === "move" && r.status === "accepted");
@@ -426,6 +496,7 @@ export class SyncEngine {
       }
       await this.save();
     }
+    if (retry.length > 0) await this.push(retry, report, true);
   }
 
   // ---- local helpers ----
@@ -487,7 +558,7 @@ export class SyncEngine {
   }
 
   private async fetchBlob(hash: BlobHash): Promise<Uint8Array> {
-    const bytes = await this.deps.remote.getBlob(hash);
+    const bytes = this.prefetched.get(hash) ?? (await this.deps.remote.getBlob(hash));
     if ((await this.hash(bytes)) !== hash) throw new Error(`blob ${hash} failed verification`);
     return bytes;
   }
@@ -495,6 +566,24 @@ export class SyncEngine {
   private save(): Promise<void> {
     return this.deps.store.save(JSON.stringify(this.state));
   }
+}
+
+/** Runs `fn` over `items` with at most `limit` running at once; rejects with the first failure after all settle. */
+async function mapLimit<T>(items: readonly T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  let failure: { error: unknown } | undefined;
+  const worker = async () => {
+    while (next < items.length && !failure) {
+      const item = items[next++]!;
+      try {
+        await fn(item);
+      } catch (error) {
+        failure ??= { error };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  if (failure) throw failure.error;
 }
 
 function parseState(json: string | null): ClientState {

@@ -1,7 +1,7 @@
 import { closeSync, fsyncSync, lstatSync, openSync, readdirSync, type Stats } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { pathKey, type LocalFs, type LocalStat } from "@bettersync/core";
+import { ConcurrentChangeError, pathKey, type LocalFs, type LocalStat } from "@bettersync/core";
 
 /**
  * A plain folder as the engine's LocalFs.
@@ -258,16 +258,6 @@ export class DiskFs implements LocalFs {
       }
       dir = dirname(dir);
     }
-  }
-}
-
-/** The file changed under the engine; the pass stops and the next one sees the change. */
-export class ConcurrentChangeError extends Error {
-  constructor(
-    readonly path: string,
-    what: string,
-  ) {
-    super(`${path} ${what}`);
   }
 }
 

@@ -107,10 +107,13 @@ export function startServer(opts: ServerOptions): RunningServer {
         if (url.pathname.startsWith("/v1/blobs/")) {
           const hash = url.pathname.slice("/v1/blobs/".length);
           if (!isSha256Hex(hash)) return text(400, "bad blob hash");
-          if (req.method === "HEAD") return new Response(null, { status: vault.hasBlob(hash) ? 200 : 404 });
+          // Never cacheable: a cached GET would answer a later HEAD (Chromium, so the plugin does this),
+          // and a client told a blob exists that this server lacks (a restore, a new server at the
+          // same URL) would never upload it.
+          if (req.method === "HEAD") return new Response(null, { status: vault.hasBlob(hash) ? 200 : 404, headers: { "Cache-Control": "no-store" } });
           if (req.method === "GET") {
             const bytes = vault.blob(hash);
-            return bytes ? new Response(bytes as Uint8Array<ArrayBuffer>, { headers: { "Content-Type": "application/octet-stream", "Cache-Control": "private, immutable, max-age=31536000" } }) : text(404, "no such blob");
+            return bytes ? new Response(bytes as Uint8Array<ArrayBuffer>, { headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store" } }) : text(404, "no such blob");
           }
           if (req.method === "PUT") {
             await vault.putBlob(hash, new Uint8Array(await req.arrayBuffer()));

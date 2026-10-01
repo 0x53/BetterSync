@@ -8,10 +8,12 @@
   "scripts": {
     "test": "bun test",
     "fuzz": "FUZZ_ITERS=20000 bun test packages/core/test/merge.fuzz.test.ts",
-    "sim": "SIM_SEEDS=5000 bun test packages/sim",
+    "sim": "SIM_SEEDS=5000 bun test packages/sim packages/plugin/test/sim.test.ts",
     "kill": "E2E_RUNS=10 E2E_SECONDS=60 bun test packages/headless/test/kill.test.ts",
-    "build": "bun run --cwd packages/server build && bun run --cwd packages/headless build",
-    "typecheck": "tsc --noEmit -p ."
+    "build": "bun run --cwd packages/server build && bun run --cwd packages/headless build && bun run --cwd packages/plugin build",
+    "typecheck": "tsc --noEmit -p .",
+    "obsidian": "bun run --cwd packages/plugin dev && bun test packages/plugin/test/obsidian.e2e.test.ts",
+    "obsidian:kill": "bun run --cwd packages/plugin dev && bun test packages/plugin/test/obsidian.kill.test.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.2.0",

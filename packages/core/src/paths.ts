@@ -5,7 +5,10 @@
 
 export const MAX_NOTE_BYTES = 10 * 1024 * 1024;
 
-const IGNORED_ROOTS = new Set([".obsidian", ".trash"]);
+/** Characters Windows cannot store in a name (iOS and macOS also refuse ":"). */
+const NON_PORTABLE = /[<>:"|?*]/;
+/** Device names Windows reserves, with or without an extension. */
+const RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
 
 export function normalizePath(path: string): string {
   return path.normalize("NFC");
@@ -20,8 +23,12 @@ export function invalidPathReason(path: string): string | null {
   if (/[\u0000-\u001f\u007f]/.test(path)) return "contains a control character";
   const segments = path.split("/");
   if (segments.some((s) => s === "" || s === "." || s === "..")) return "empty, '.' or '..' segment";
-  if (IGNORED_ROOTS.has(segments[0]!)) return `inside ${segments[0]}/`;
-  if (segments.at(-1) === ".md") return "no file name";
+  // Obsidian hides and never indexes these (.obsidian, .trash, .git, ...), so its plugin could not keep them.
+  if (segments.some((s) => s.startsWith("."))) return "hidden (a name starts with '.')";
+  // Every device must be able to hold every note, or its client stalls on it.
+  if (segments.some((s) => NON_PORTABLE.test(s))) return 'contains one of < > : " | ? *';
+  if (segments.some((s) => s.endsWith(" ") || s.endsWith("."))) return "a name ends with a space or '.'";
+  if (segments.some((s) => RESERVED.test(s))) return "a name Windows reserves (CON, NUL, COM1, ...)";
   return null;
 }
 

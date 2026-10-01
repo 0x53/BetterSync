@@ -3,10 +3,9 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { SyncEngine } from "@bettersync/core";
-import { ConcurrentChangeError, DiskFs } from "./fs.ts";
-import { HttpError, HttpRemote } from "./remote.ts";
-import { Runner } from "./runner.ts";
+import { ConcurrentChangeError, HttpError, HttpRemote, SyncEngine } from "@bettersync/core";
+import { DiskFs } from "./fs.ts";
+import { FolderRunner } from "./runner.ts";
 import { FileStateStore, FolderLock, stateDir } from "./state.ts";
 
 /**
@@ -104,7 +103,7 @@ async function main(argv: string[]): Promise<number | undefined> {
     }
   }
 
-  const runner = new Runner({ engine, remote, folder, log });
+  const runner = new FolderRunner({ engine, live: () => remote.live(), folder, log: (m) => log(m === "the server rejected the token" ? `${m}; set the current one (BETTERSYNC_TOKEN or the config file)` : m) });
   log(`syncing ${folder} with ${server} as ${device}`);
   runner.start();
   const shutdown = async () => {

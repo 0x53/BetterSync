@@ -1,4 +1,4 @@
-import { MemoryVaultStore, pathKey, Rng, SyncEngine, Vault, type Change, type Op, type PassReport, type Remote, type VaultStore } from "@bettersync/core";
+import { MemoryVaultStore, pathKey, Rng, SyncEngine, Vault, type Change, type LocalFs, type Op, type PassReport, type Remote, type VaultStore } from "@bettersync/core";
 import { SimFs, type Clobber } from "./fs.ts";
 import { hashAsync, hashSync } from "./hash.ts";
 import { checkInvariants } from "./invariants.ts";
@@ -22,6 +22,12 @@ export interface SimConfig {
    * in-memory store that survives crashes.
    */
   store?: () => SimStore;
+  /**
+   * The LocalFs a client's engine sees, given its disk and the disk's
+   * engine view. Called at every (re)start. Default: the engine view itself.
+   * The plugin's tests put its Obsidian adapter here.
+   */
+  localFs?: (client: { device: string; fs: SimFs; view: LocalFs }) => LocalFs;
   log?: (message: string) => void;
 }
 
@@ -155,8 +161,9 @@ export class World {
 
   private start(c: SimClient): Promise<void> {
     const epoch = c.epoch;
+    const view = c.fs.engineView(c.device, this.clobbered, () => this.sched.now, this.config.log && ((m) => this.config.log!(`t=${this.sched.now} ${c.device}: ${m}`)));
     const opened = SyncEngine.open({
-      fs: c.fs.engineView(c.device, this.clobbered, () => this.sched.now, this.config.log && ((m) => this.config.log!(`t=${this.sched.now} ${c.device}: ${m}`))),
+      fs: this.config.localFs ? this.config.localFs({ device: c.device, fs: c.fs, view }) : view,
       remote: this.remote(c),
       store: {
         load: async () => c.stateJson,

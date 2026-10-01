@@ -26,6 +26,8 @@ export interface Clobber {
  */
 export class SimFs {
   private readonly files = new Map<string, Entry>();
+  /** Told about the user's changes, as a file watcher would be (the plugin's fake vault listens). */
+  onUserChange: ((kind: "create" | "modify" | "delete" | "rename", path: string, oldPath?: string) => void) | undefined;
 
   constructor(
     readonly caseInsensitive: boolean,
@@ -53,18 +55,25 @@ export class SimFs {
 
   userWrite(path: string, bytes: Uint8Array): void {
     const e = this.get(path);
-    this.files.set(this.k(path), { name: e?.name ?? path, bytes, mtime: this.tick() });
+    const name = e?.name ?? path;
+    this.files.set(this.k(path), { name, bytes, mtime: this.tick() });
+    this.onUserChange?.(e ? "modify" : "create", name);
   }
 
   userRemove(path: string): void {
+    const e = this.get(path);
     this.files.delete(this.k(path));
+    if (e) this.onUserChange?.("delete", e.name);
   }
 
   userRename(from: string, to: string): void {
     const e = this.get(from);
     if (!e) return;
+    const replaced = this.get(to);
     this.files.delete(this.k(from));
+    if (replaced && replaced !== e) this.onUserChange?.("delete", replaced.name);
     this.files.set(this.k(to), { name: to, bytes: e.bytes, mtime: e.mtime });
+    this.onUserChange?.("rename", to, e.name);
   }
 
   engineView(device: string, clobbered: Clobber[], now: () => number, log?: (m: string) => void): LocalFs {

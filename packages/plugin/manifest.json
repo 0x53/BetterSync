@@ -1,0 +1,9 @@
+{
+  "id": "bettersync",
+  "name": "BetterSync",
+  "version": "0.3.0",
+  "minAppVersion": "1.5.0",
+  "description": "Syncs your vault's notes through your own BetterSync server.",
+  "author": "0x53",
+  "isDesktopOnly": false
+}

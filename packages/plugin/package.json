@@ -2,6 +2,20 @@
   "name": "@bettersync/plugin",
   "private": true,
   "type": "module",
-  "exports": { ".": "./src/index.ts" },
-  "dependencies": { "@bettersync/core": "workspace:*" }
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@bettersync/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@bettersync/sim": "workspace:*",
+    "esbuild": "^0.28.2",
+    "obsidian": "^1.13.1",
+    "playwright-core": "^1.63.0"
+  },
+  "scripts": {
+    "build": "bun build.ts --minify",
+    "dev": "bun build.ts"
+  }
 }

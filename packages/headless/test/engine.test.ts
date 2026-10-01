@@ -2,8 +2,8 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryVaultStore, SyncEngine, Vault, type LocalFs, type Remote } from "@bettersync/core";
-import { ConcurrentChangeError, DiskFs } from "../src/fs.ts";
+import { ConcurrentChangeError, MemoryVaultStore, SyncEngine, Vault, type LocalFs, type Remote } from "@bettersync/core";
+import { DiskFs } from "../src/fs.ts";
 import { FileStateStore } from "../src/state.ts";
 
 /**

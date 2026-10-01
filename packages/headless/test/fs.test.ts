@@ -2,7 +2,8 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ConcurrentChangeError, DiskFs } from "../src/fs.ts";
+import { ConcurrentChangeError } from "@bettersync/core";
+import { DiskFs } from "../src/fs.ts";
 
 /**
  * DiskFs on real disks. Runs in the system temp folder and, when
