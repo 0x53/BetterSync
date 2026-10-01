@@ -4,6 +4,20 @@ Found while deploying BetterSync `b0d1119` on a home server (server and headless
 client in Docker behind nginx at a path prefix) and Obsidian on Windows (`laptop`).
 The tests started on 2026-10-01. Ordered by priority.
 
+**Status after upstream `a517f6a` (post-M3 review, deployed 2026-10-01):**
+
+| Item | Status |
+|---|---|
+| 1. Conflict copy per autosave | Open |
+| 2. Symlinked parent folders | **Fixed** (DiskFs no longer writes through symlinked folders) |
+| 3. Notice storm | Open |
+| 4. Backup command | Open |
+| 4. Token in container log | Partly addressed by `rotate-token --init`; the first `serve` still logs it |
+| 4. DB created 0644 | Fixed for new files (umask 077); see item 6 for existing data |
+| 4. Path-prefix docs, recovering deleted copies | Open |
+| 5. Stale replica on join | Open |
+| 6. Upgrade-time items | Open |
+
 ## 1. Continuous typing on a contested line makes one conflict copy per autosave
 
 **Severity:** high for usability, but nothing is lost. The worst case is clutter, as designed.
@@ -151,6 +165,18 @@ which the design rightly does not. The conflict copy is the correct safe outcome
   vault stays clean. This needs M4's history; until then, conflict copies are the safe default.
 - **Migration import:** optionally seed the server's history with known prior versions
   (git history, or the old sync's replica) so replay detection recognises them.
+
+## 6. Upgrade-time items (found upgrading `b0d1119` → `a517f6a`)
+
+- **Existing data files keep their old modes.** umask 077 only applies to files created
+  from now on. After the upgrade, `bettersync.db` and `-shm` were still 0644. `serve`
+  should `chmod` the data directory's files to owner-only at startup.
+- **The plugin version did not change (0.3.0)** across a data-loss fix release. Obsidian
+  and BRAT therefore cannot tell a device is out of date, and the only way to check is
+  comparing `main.js` hashes by hand. Bump `manifest.json`'s `version` on every release.
+  Possibly also send the client version in a header and log it on the server.
+- **`bun run build` leaves the tree dirty.** It changes `packages/server/src/cli.ts`
+  to mode 0755. Either commit the executable bit or stop the build from setting it.
 
 ## Not a bug, but trial feedback
 
