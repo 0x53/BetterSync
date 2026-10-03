@@ -17,6 +17,7 @@ The tests started on 2026-10-01. Ordered by priority.
 | 4. Path-prefix docs, recovering deleted copies | Open |
 | 5. Stale replica on join | Open |
 | 6. Upgrade-time items | Open |
+| 7. No visible sync feedback | Open |
 
 ## 1. Continuous typing on a contested line makes one conflict copy per autosave
 
@@ -177,6 +178,31 @@ which the design rightly does not. The conflict copy is the correct safe outcome
   Possibly also send the client version in a header and log it on the server.
 - **`bun run build` leaves the tree dirty.** It changes `packages/server/src/cli.ts`
   to mode 0755. Either commit the executable bit or stop the build from setting it.
+
+## 7. No visible sync feedback (plugin only)
+
+**Reported 2026-10-03 by the user.** Sync itself is fast and seamless, but there is no
+clear sign that it worked, so the user keeps asking "did that work?".
+
+**Cause:** in `packages/plugin/src/main.ts` (`STATUS`), `idle` ("starting") and `synced`
+both show the plain `cloud` icon. `syncing` shows `refresh-cw`, but a sync usually ends
+too quickly for that to be seen. Only the tooltip tells the states apart.
+
+**Ideas, smallest first.** None of them needs a server change, so they can ship through
+BRAT alone.
+
+1. **Distinct status icons.** A spinner while syncing (kept on screen for at least ~0.5 s
+   so it's visible), a check (e.g. `cloud-check`) once synced, and an x or `cloud-off`
+   when offline or the token is rejected. Possibly a "last synced 12 s ago" tooltip.
+2. **Recent activity list.** Show recent changes in the settings tab, or in a modal or
+   side view opened by clicking the status icon. One row per note, newest first: time,
+   path, direction (pulled/pushed), and size change such as `+42 / −7` characters or
+   bytes. Include deletes, renames and conflict copies. Keep the last ~100 entries in memory
+   (or in plugin data, so they survive a restart).
+3. **Highlight remote edits in the open note.** When a remote change is merged into an
+   open editor (the plugin already does this with a CodeMirror transaction), briefly mark
+   the inserted text green and show a short red marker where text was removed, fading
+   after a few seconds. Use a CodeMirror decoration so nothing is written to the note.
 
 ## Not a bug, but trial feedback
 
