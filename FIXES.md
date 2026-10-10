@@ -17,7 +17,7 @@ The tests started on 2026-10-01. Ordered by priority.
 | 4. Path-prefix docs, recovering deleted copies | Open |
 | 5. Stale replica on join | Open |
 | 6. Upgrade-time items | Open |
-| 7. No visible sync feedback | Open |
+| 7. No visible sync feedback (incl. mobile: no visible status, stale ribbon-menu label) | Open |
 
 ## 1. Continuous typing on a contested line makes one conflict copy per autosave
 
@@ -203,6 +203,25 @@ BRAT alone.
    open editor (the plugin already does this with a CodeMirror transaction), briefly mark
    the inserted text green and show a short red marker where text was removed, fading
    after a few seconds. Use a CodeMirror decoration so nothing is written to the note.
+
+**Mobile (found 2026-10-10 on the iPhone, away from home).** The phone was syncing: the
+server recorded an `iphone` put at 22:37 BST. Still, nothing on the phone showed it.
+
+- **The ribbon is not visible.** Mobile has no status bar, so the README says "the same
+  icon sits in the ribbon". Current Obsidian mobile has no ribbon in the left sidebar,
+  which shows only the file tree and its buttons. Ribbon items are in the menu under the
+  bottom bar's three-line button.
+- **That menu entry is stale and misleading.** It reads "BetterSync: enter the server URL
+  and token in settings", the `STATUS.setup` label passed to `addRibbonIcon` at load.
+  `render()` updates the returned element's icon and `aria-label`, but the menu evidently
+  uses the label and icon given at registration. It looks like setup is unfinished on a
+  working device, and the icon is probably frozen at `cloud-cog`.
+- **Only the command palette works:** "Show sync status" gives the correct Notice.
+- **Fix:** give the ribbon item a neutral fixed label ("BetterSync: sync status") that
+  opens the status (last successful pass, last error, "Sync now"). For an indicator that is
+  always visible on mobile, put the status icon in the active note's view header
+  (`addAction`) and keep it updated from `render()`. Update the README's mobile paragraph,
+  and test on a real iPhone, because mobile emulation did not catch this.
 
 ## Not a bug, but trial feedback
 
