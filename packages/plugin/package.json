@@ -1,6 +1,7 @@
 {
   "name": "@bettersync/plugin",
   "private": true,
+  "license": "0BSD",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"

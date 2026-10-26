@@ -1,6 +1,7 @@
 {
   "name": "bettersync",
   "private": true,
+  "license": "0BSD",
   "type": "module",
   "workspaces": [
     "packages/*"

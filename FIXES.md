@@ -1,10 +1,10 @@
 # Fixes from the M3 daily-driver trial
 
-Found while deploying BetterSync `b0d1119` on a home server (server and headless
+Found while deploying BetterSync `282521d` on a home server (server and headless
 client in Docker behind nginx at a path prefix) and Obsidian on Windows (`laptop`).
 The tests started on 2026-10-01. Ordered by priority.
 
-**Status after upstream `a517f6a` (post-M3 review, deployed 2026-10-01):**
+**Status after upstream `4acd312` (post-M3 review, deployed 2026-10-01):**
 
 | Item | Status |
 |---|---|
@@ -167,7 +167,7 @@ which the design rightly does not. The conflict copy is the correct safe outcome
 - **Migration import:** optionally seed the server's history with known prior versions
   (git history, or the old sync's replica) so replay detection recognises them.
 
-## 6. Upgrade-time items (found upgrading `b0d1119` → `a517f6a`)
+## 6. Upgrade-time items (found upgrading `282521d` → `4acd312`)
 
 - **Existing data files keep their old modes.** umask 077 only applies to files created
   from now on. After the upgrade, `bettersync.db` and `-shm` were still 0644. `serve`

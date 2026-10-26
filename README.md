@@ -1,8 +1,12 @@
 # BetterSync
 
-Syncs one person's Obsidian vault across their devices and agents through a small self-hosted server. The design doc is the source of truth for scope and decisions.
+Syncs one person's Obsidian vault across their devices and agents through a small self-hosted server: one server behind your own nginx, an Obsidian plugin (desktop and iOS), and a headless client that keeps a plain folder in sync for agents and scripts. Markdown notes only, one user, one vault, one shared token. Correctness comes first: every device converges to the same files, and no edit is silently lost.
 
-Status: **M3 built**. The Obsidian plugin runs the shared engine on the vault. It passes the simulator with its adapter, end-to-end tests in a real Obsidian (on case-sensitive and case-insensitive disks), and kill tests in which Obsidian itself is SIGKILLed at random alongside the headless clients and the server. The M3 gate is daily use on all your devices, with LiveSync retired; iOS is checked by hand (see [Plugin on iOS](#plugin-on-ios)). That trial is under way on Windows and iPhone (since 2026-10-01); issues found so far are collected in [FIXES.md](FIXES.md) and fixed in a batch afterwards.
+**Early software.** It is used daily by its author but has no release yet, and the protocol and on-disk formats may still change. Keep a backup of your vault.
+
+The design doc, [docs/DESIGN.md](docs/DESIGN.md), is the source of truth for scope and decisions; source comments that cite "design doc" refer to its sections. Licensed under [0BSD](LICENSE): use it for anything, no attribution needed.
+
+Status: **M3 built**. The Obsidian plugin runs the shared engine on the vault. It passes the simulator with its adapter, end-to-end tests in a real Obsidian (on case-sensitive and case-insensitive disks), and kill tests in which Obsidian itself is SIGKILLed at random alongside the headless clients and the server. The M3 gate is daily use on all of the author's devices, with LiveSync retired; iOS is checked by hand (see [Plugin on iOS](#plugin-on-ios)). That trial is under way on Windows and iPhone (since 2026-10-01); issues found so far are collected in [FIXES.md](FIXES.md) and fixed in a batch afterwards.
 
 ## Layout
 
@@ -53,7 +57,7 @@ docker compose -f deploy/docker-compose.yml exec bettersync bettersync rotate-to
 
 Without Docker: `bun packages/server/src/cli.ts serve --data ./data` (listens on 127.0.0.1:8787).
 
-Obsidian plugin: `bun run build`, then copy `packages/plugin/dist/main.js` and `manifest.json` into `<vault>/.obsidian/plugins/bettersync/`, enable BetterSync under Community plugins, and enter the server URL and token. On iOS, where the Files app hides `.obsidian`, install with the BRAT plugin: "Add beta plugin" → `0x53/BetterSyncReleases`. To publish a version there, commit the two built files (with a new `version` in `manifest.json`) to that repo and run its Release workflow from the Actions tab.
+Obsidian plugin: `bun run build`, then copy `packages/plugin/dist/main.js` and `manifest.json` into `<vault>/.obsidian/plugins/bettersync/`, enable BetterSync under Community plugins, and enter the server URL and token. On iOS, where the Files app hides `.obsidian`, install with the [BRAT](https://github.com/TfTHacker/obsidian42-brat) plugin from a GitHub repo that has the two files attached to a release: "Add beta plugin" → `<owner>/<repo>`. The author's builds are published that way from `0x53/BetterSyncReleases`; to publish a version there, commit the two built files (with a new `version` in `manifest.json`) to that repo and run its Release workflow from the Actions tab.
 
 Headless client, for agents and scripts:
 

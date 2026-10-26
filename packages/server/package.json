@@ -1,6 +1,7 @@
 {
   "name": "@bettersync/server",
   "private": true,
+  "license": "0BSD",
   "type": "module",
   "exports": { ".": "./src/index.ts" },
   "bin": { "bettersync-server": "./src/cli.ts" },
